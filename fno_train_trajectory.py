@@ -61,8 +61,8 @@ class TrajectoryDataset(Dataset):
 
 
 def relative_l2_error(pred, target):
-    num = torch.norm(pred - target, dim=(-3, -2, -1))
-    den = torch.norm(target, dim=(-3, -2, -1)) + 1e-8
+    num = torch.linalg.vector_norm(pred - target, dim=(-3, -2, -1))
+    den = torch.linalg.vector_norm(target, dim=(-3, -2, -1)) + 1e-8
     return (num / den).mean()
 
 
