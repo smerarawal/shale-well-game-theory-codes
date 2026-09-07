@@ -1,5 +1,5 @@
 """
-Visualize Stage 2 results for presentation. Reads the .npz files saved by
+Visualize Stage 2 results for presentation. Reads the .npz files saved by 
 shapley_values.py, blotto_solver.py, and blotto_constrained.py.
 
 Run locally (or in Kaggle) after those scripts have produced their .npz files:
