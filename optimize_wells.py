@@ -1,7 +1,7 @@
 """
 Stage 1: single-agent well placement optimization.
 
-Given a fixed permeability field, choose k well locations (out of a large
+Given a fixed permeability field, choose k well locations (out of a large 
 candidate grid) to maximize total payoff, using the trained FNO as a fast
 payoff function instead of the FD solver (that's the whole point of Stage 0).
 
