@@ -1,5 +1,5 @@
 """
-Single entry point for a fresh Kaggle/Colab session. Checks what already
+Single entry point for a fresh Kaggle/Colab session. Checks what already 
 exists on disk and ONLY regenerates/retrains what's missing -- if you've
 pushed dataset_2000.npz and fno_surrogate.pt to GitHub and pulled them,
 this skips straight to Stage 2 in seconds.
