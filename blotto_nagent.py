@@ -1,7 +1,7 @@
 """
 Stage 3b: N-agent Blotto. So far only 2 rival agents. Real shale acreage
 often has 3+ competing operators. This generalizes iterated best response
-to N agents, cycling through each in turn (round-robin), each optimizing
+to N agents, cycling through each in turn (round-robin), each optimizing 
 against everyone else's current fixed placement.
 
 Run:
