@@ -70,8 +70,8 @@ def terminal_payoff_to_dollars(proxy_payoff, discount_periods=0):
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    norm_stats = load_norm_stats()
-    model = load_fno(device=device)
+    norm_stats = load_norm_stats(NPZ_PATH)
+    model = load_fno(CKPT_PATH, device)
 
     np.random.seed(11)
     perm = random_permeability_field(NX, NY)
