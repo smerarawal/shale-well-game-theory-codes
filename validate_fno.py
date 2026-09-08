@@ -1,5 +1,5 @@
 """
-Stage 0 validation: compare the trained FNO surrogate against the FD
+Stage 0 validation: compare the trained FNO surrogate against the FD 
 solver (ground truth) on FRESH cases it never saw during training, and
 check inference speed for repeated batch queries.
 

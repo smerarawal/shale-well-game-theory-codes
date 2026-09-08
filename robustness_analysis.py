@@ -1,5 +1,5 @@
 """
-Stage 3a: robustness across geology. Everything so far (Shapley values,
+Stage 3a: robustness across geology. Everything so far (Shapley values,  
 Blotto equilibrium) was computed on ONE random permeability field. A
 reviewer's first question will be "does this hold in general, or did you
 get lucky with one map?" This runs the same analyses across multiple

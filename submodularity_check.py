@@ -1,6 +1,6 @@
 """
-Stage 3c: submodularity check. Stage 1's greedy well placement is only
-guaranteed near-optimal (the classic 1 - 1/e bound) if the payoff function
+Stage 3c: submodularity check. Stage 1's greedy well placement is only 
+guaranteed near-optimal (the classic 1 - 1/e bound) if the payoff function 
 is submodular -- meaning each additional well gives diminishing marginal
 returns as more wells are already placed. This was FLAGGED AS AN
 ASSUMPTION, not proven, in optimize_wells.py. This script tests it

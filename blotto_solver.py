@@ -1,5 +1,5 @@
 """
-Stage 2b: Colonel Blotto framing -- two rival agents independently choose
+Stage 2b: Colonel Blotto framing -- two rival agents independently choose 
 where to place a fixed budget of wells on the same/overlapping grid, each
 maximizing their OWN payoff given the other's placement. No coordination.
 

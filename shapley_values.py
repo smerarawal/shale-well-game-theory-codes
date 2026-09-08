@@ -2,7 +2,7 @@
 Stage 2a: Shapley values for cooperative multi-agent well placement.
 
 Setup: N agents, each already assigned a fixed subset of wells on the
-shared grid (who places where is decided elsewhere -- this script answers
+shared grid (who places where is decided elsewhere -- this script answers 
 "given these placements, how should the total payoff be fairly split?").
 
 Exact Shapley values: factorial in N, only run for N <= ~6.

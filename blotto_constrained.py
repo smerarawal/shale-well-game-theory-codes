@@ -3,7 +3,7 @@ Stage 2c: constrained-region Colonel Blotto.
 
 The Stage 2b run converged trivially in 1 round because agents A and B
 simply moved to opposite corners of a big candidate pool -- avoidance,
-not real competition. This version confines BOTH agents to the same
+not real competition. This version confines BOTH agents to the same 
 restricted sub-region of the grid, so they cannot simply avoid each other
 and must genuinely compete for overlapping territory. This is the more
 interesting/harder equilibrium.
