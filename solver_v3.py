@@ -19,6 +19,8 @@ centered differencing is unconditionally unstable for pure advection) and
 sub-cycled under its OWN CFL condition, separate from the pressure CFL.
 """
 import numpy as np
+from scipy.sparse import lil_matrix, csr_matrix
+from scipy.sparse.linalg import spsolve
 
 
 # ---- Part A.2: Corey relative permeability ----
@@ -110,6 +112,68 @@ def max_stable_dt_saturation(Sw, vel_x, vel_y, phi, dx, mu_w=1.0, mu_n=5.0, safe
     return safety * phi_min * dx / (dfw_dSw_max * vel_mag_max + 1e-8)
 
 
+# ---- implicit pressure solve (the real fix for B.2) ----
+
+def solve_pressure_implicit(p_old, k_e, k_w, k_n, k_s, lam_e, lam_w, lam_n, lam_s,
+                              phi, ct, dt, source_total, dx=1.0):
+    """
+    Backward-Euler IMPLICIT solve of:
+        phi*ct*(p_new - p_old)/dt = div(lambda*k*grad(p_new)) + source
+    via a direct sparse linear solve, NOT explicit pseudo-time marching.
+
+    This is the actual fix for the B.2 mass-conservation problem found
+    during validation: explicit marching only approximately satisfies the
+    discrete balance each step (the residual gets silently absorbed into
+    "ongoing pressure change", which corrupts the saturation equation's
+    convective term downstream). A direct linear solve satisfies the
+    discrete equation EXACTLY (to linear-solver tolerance) at every cell,
+    every step, so the velocity field derived from p_new is consistent
+    with well rates immediately, not only after many small steps.
+    Also unconditionally stable, so dt is now an ACCURACY choice, not a
+    stability constraint (though the same CFL-derived dt is still passed
+    in here, to keep the physical timescale interpretation unchanged
+    relative to the explicit version).
+    """
+    nx, ny = p_old.shape
+    n = nx * ny
+
+    T_e = (k_e * lam_e / dx ** 2).flatten()
+    T_w = (k_w * lam_w / dx ** 2).flatten()
+    T_n = (k_n * lam_n / dx ** 2).flatten()
+    T_s = (k_s * lam_s / dx ** 2).flatten()
+    accumulation = (phi * ct / dt).flatten()
+
+    def idx(i, j):
+        return i * ny + j
+
+    A = lil_matrix((n, n))
+    b = np.zeros(n)
+
+    for i in range(nx):
+        for j in range(ny):
+            m = idx(i, j)
+            diag = accumulation[m]
+            b[m] = accumulation[m] * p_old[i, j] + source_total[i, j]
+
+            if i < nx - 1:
+                A[m, idx(i + 1, j)] -= T_e[m]
+                diag += T_e[m]
+            if i > 0:
+                A[m, idx(i - 1, j)] -= T_w[m]
+                diag += T_w[m]
+            if j < ny - 1:
+                A[m, idx(i, j + 1)] -= T_n[m]
+                diag += T_n[m]
+            if j > 0:
+                A[m, idx(i, j - 1)] -= T_s[m]
+                diag += T_s[m]
+
+            A[m, m] = diag
+
+    p_new_flat = spsolve(csr_matrix(A), b)
+    return p_new_flat.reshape(nx, ny)
+
+
 # ---- main two-phase IMPES solver ----
 
 def solve_two_phase(
@@ -174,12 +238,6 @@ def solve_two_phase(
         p_e[:-1, :] = p[1:, :]; p_w[1:, :] = p[:-1, :]
         p_n[:, :-1] = p[:, 1:]; p_s[:, 1:] = p[:, :-1]
 
-        flux_e = k_e * lam_e * (p_e - p)
-        flux_w = k_w * lam_w * (p - p_w)
-        flux_n = k_n * lam_n * (p_n - p)
-        flux_s = k_s * lam_s * (p - p_s)
-        div_flux = (flux_e - flux_w + flux_n - flux_s) / dx ** 2
-
         source_total = np.zeros((nx, ny))
         source_water = np.zeros((nx, ny))
         fw_current = fractional_flow(Sw, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
@@ -192,7 +250,8 @@ def solve_two_phase(
                 source_total[i, j] -= rates[idx]
                 source_water[i, j] -= rates[idx] * fw_current[i, j]
 
-        p = p + dt_pressure / (phi * ct) * (div_flux + source_total)
+        p = solve_pressure_implicit(p, k_e, k_w, k_n, k_s, lam_e, lam_w, lam_n, lam_s,
+                                     phi, ct, dt_pressure, source_total, dx=dx)
 
         p_e2 = np.zeros_like(p); p_e2[:-1, :] = p[1:, :]
         p_n2 = np.zeros_like(p); p_n2[:, :-1] = p[:, 1:]
