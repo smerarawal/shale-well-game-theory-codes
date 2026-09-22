@@ -1,16 +1,11 @@
 """
 visualize_solver_v3.py -- plots for solver_v3.py / validate_solver_v3.py.
 
-IMPORTANT CAVEAT, carried over from the validation status: B.1 (Buckley-
-Leverett) passes robustly and its plot below is trustworthy. B.2
-(backward-compatibility) currently FAILS due to an unresolved mass-
-conservation issue in the explicit pressure marching (see validate_solver_v3.py
-and the project handoff notes) -- the 2D injector/producer plot below shows
-solve_two_phase()'s QUALITATIVE behavior (water does spread from the
-injector, as expected), but the underlying quantitative mass balance near
-wells is not yet trustworthy. Treat the 2D plot as "this runs and looks
-directionally right," not as validated quantitative output, until B.2 is
-fixed with a proper implicit pressure solve.
+STATUS (current): B.1 (Buckley-Leverett), B.2 (mass conservation, via the
+implicit pressure solve), and B.3 (gravity segregation + mass conservation
+under gravity) all PASS -- see validate_solver_v3.py. All three plots
+below are trustworthy quantitative output, not just qualitative sanity
+checks.
 
 Run:
     pip install matplotlib
@@ -97,6 +92,53 @@ def plot_2d_injector_producer(out_path="solver_v3_2d_smoke_test.png"):
     print(f"saved {out_path}")
 
 
+def plot_gravity_override(out_path="solver_v3_gravity_override.png"):
+    """
+    A single injector, no producer, with gravity on vs off -- shows
+    buoyant override during an ACTIVE flood, not just a static patch
+    (that's B.3's test). solve_two_phase can only actively INJECT the
+    wetting phase (well_is_water_injector=True adds a pure-water source
+    term; there's no symmetric "inject non-wetting" path), so this
+    demonstrates it the other physically valid way round: water (wetting,
+    rho_w=1.0, denser) is injected into a reservoir that starts full of
+    the buoyant non-wetting phase (rho_n=0.6, e.g. CO2/oil/gas -- the
+    resident fluid, not what's injected here). Without gravity the
+    waterflood front spreads symmetrically from the injector; with
+    gravity, the denser injected water should sink preferentially (invade
+    deeper/larger-j cells more than shallow ones), which is exactly the
+    asymmetry to look for below.
+    """
+    nx, ny = 32, 32
+    k = np.full((nx, ny), 0.1)
+    phi = np.full((nx, ny), 0.2)
+    injector = (16, 16)  # centered, so any asymmetry in the plots is gravity's doing, not geometry
+
+    _, s_nograv, _ = solve_two_phase(
+        k, phi, well_locations=[injector], well_rates=[1.0], well_is_water_injector=[True],
+        n_pressure_steps=250, save_every=250, add_gravity=False,
+    )
+    _, s_grav, _ = solve_two_phase(
+        k, phi, well_locations=[injector], well_rates=[1.0], well_is_water_injector=[True],
+        n_pressure_steps=250, save_every=250,
+        add_gravity=True, rho_w=1.0, rho_n=0.6, g=2.0,
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    for ax, hist, title in [(axes[0], s_nograv, "No gravity: symmetric waterflood"),
+                             (axes[1], s_grav, "WITH gravity: denser water sinks (invades toward bottom=deep)")]:
+        im = ax.imshow(hist[-1].T, cmap="Blues", vmin=0.2, vmax=0.8)
+        ax.plot(injector[0], injector[1], "r*", markersize=14)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+    fig.suptitle("Water injection (wetting, denser) into a buoyant-resident-fluid reservoir: gravity override\n"
+                  "(dark=water-invaded; depth increases DOWN the image here, j=0/shallow at top)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    print(f"saved {out_path}")
+
+
 if __name__ == "__main__":
     plot_buckley_leverett_validation()
     plot_2d_injector_producer()
+    plot_gravity_override()

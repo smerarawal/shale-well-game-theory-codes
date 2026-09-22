@@ -252,6 +252,96 @@ def dataset_permeability_histogram(npz_path, title_prefix, out_name):
     savefig(fig, out_name)
 
 
+def dataset_v3_field_samples(npz_path, title_prefix, out_name):
+    """v1/v2's dataset_field_samples() only shows INPUT fields -- v3 has two
+    OUTPUT fields worth seeing too (final_pressure, final_saturation), and
+    well_mask is genuinely informative here since injector/producer are
+    both present (unlike v1/v2's producer-only wells, this is +rate at
+    injectors, -rate at producers)."""
+    data = try_load(npz_path)
+    if data is None:
+        raise RuntimeError(f"{npz_path} not found in working directory")
+
+    n_show = 4
+    row_specs = [
+        ("permeability", "viridis"), ("porosity", "plasma"), ("well_mask", "coolwarm"),
+        ("final_pressure", "RdBu_r"), ("final_saturation", "Blues"),
+    ]
+    row_specs = [(k, cmap) for k, cmap in row_specs if k in data]
+    if not row_specs:
+        raise RuntimeError(f"no recognized v3 field keys in {npz_path}, found: {list(data.keys())}")
+
+    fig, axes = plt.subplots(len(row_specs), n_show, figsize=(4 * n_show, 4 * len(row_specs)))
+    for row, (fk, cmap) in enumerate(row_specs):
+        vmin, vmax = data[fk][:n_show].min(), data[fk][:n_show].max()
+        for col in range(n_show):
+            kwargs = {"vmin": vmin, "vmax": vmax} if fk == "well_mask" else {}
+            im = axes[row, col].imshow(data[fk][col].T, origin="lower", cmap=cmap, **kwargs)
+            axes[row, col].set_title(f"{fk}[{col}]", fontsize=9)
+            axes[row, col].axis("off")
+        plt.colorbar(im, ax=axes[row, :], fraction=0.015, pad=0.01)
+    fig.suptitle(f"{title_prefix}: sample input+output fields (first {n_show} dataset entries)")
+    savefig(fig, out_name)
+
+
+def dataset_v3_gravity_vs_nogravity():
+    """Physics illustration (no saved file needed, self-contained): the
+    same buoyant-patch setup used in validate_solver_v3.py's B.3 test,
+    shown visually rather than as a scalar centroid number. Also the
+    figure that would have made the pre-fix mass-conservation bug in
+    conservative_clip's docstring obvious at a glance (water visibly
+    vanishing, not just a metric drifting)."""
+    from solver_v3 import solve_two_phase
+
+    nx, ny = 24, 24
+    k = np.full((nx, ny), 0.1)
+    phi = np.full((nx, ny), 0.2)
+    Sw0 = np.full((nx, ny), 0.8)
+    Sw0[:, 10:14] = 0.2  # buoyant non-wetting patch at mid-depth
+
+    _, s_hist_nograv, _ = solve_two_phase(
+        k, phi, well_locations=[], well_rates=[], well_is_water_injector=[],
+        Sw_init=Sw0, n_pressure_steps=150, save_every=50, add_gravity=False,
+    )
+    _, s_hist_grav, _ = solve_two_phase(
+        k, phi, well_locations=[], well_rates=[], well_is_water_injector=[],
+        Sw_init=Sw0, n_pressure_steps=150, save_every=50,
+        add_gravity=True, rho_w=1.0, rho_n=0.6, g=2.0,
+    )
+    mass0 = (Sw0 * phi).sum()
+    mass_nograv = (s_hist_nograv[-1] * phi).sum()
+    mass_grav = (s_hist_grav[-1] * phi).sum()
+
+    # NOTE on orientation: solve_two_phase's docstring defines j=0 as
+    # SHALLOW, j increasing = DEEPER. s_hist[idx] has shape (nx, ny) with
+    # depth along axis 1 -- transposing puts depth along image ROWS, and
+    # imshow's DEFAULT origin ("upper", row 0 at the TOP) then puts j=0
+    # (shallow) at the top of the figure, matching the intuitive "buoyant
+    # phase rises toward the top of the picture" reading. Do NOT add
+    # origin="lower" here (unlike the areal x,y plots elsewhere in this
+    # file, where top/bottom is arbitrary) -- that would silently flip
+    # shallow/deep and make a physically-correct rise look like a sink.
+    n_snap = min(4, len(s_hist_grav))
+    idxs = np.linspace(0, len(s_hist_grav) - 1, n_snap).astype(int)
+    fig, axes = plt.subplots(2, n_snap, figsize=(4 * n_snap, 9))
+    for col, idx in enumerate(idxs):
+        axes[0, col].imshow(s_hist_nograv[idx].T, cmap="Blues_r", vmin=0.2, vmax=0.8)
+        axes[0, col].set_title(f"no gravity, step {idx * 50}")
+        axes[0, col].axis("off")
+        axes[1, col].imshow(s_hist_grav[idx].T, cmap="Blues_r", vmin=0.2, vmax=0.8)
+        axes[1, col].set_title(f"WITH gravity, step {idx * 50}")
+        axes[1, col].axis("off")
+    axes[0, 0].set_ylabel("no gravity\n(static, as expected)")
+    axes[1, 0].set_ylabel("with gravity\n(buoyant patch rises\ntoward TOP=shallow)")
+    fig.suptitle(
+        f"Gravity segregation (rho_n=0.6 < rho_w=1.0, no wells -- closed system): "
+        f"mass conserved to machine precision "
+        f"(no-grav rel.err={abs(mass_nograv-mass0)/mass0:.1e}, "
+        f"grav rel.err={abs(mass_grav-mass0)/mass0:.1e}); dark=non-wetting-rich (buoyant)"
+    )
+    savefig(fig, "17_gravity_segregation.png")
+
+
 # ===========================================================================
 # SECTION 3: FNO VALIDATION -- v1 vs v2 vs trajectory
 # (hardcoded from your actual run logs, since these are single scalar summaries)
@@ -274,6 +364,62 @@ def fno_validation_comparison():
     ax.set_ylabel("mean relative L2 error (held-out)")
     ax.set_title("FNO surrogate accuracy across physics versions (from actual run logs)")
     savefig(fig, "05_fno_validation_comparison.png")
+
+
+def surrogate_comparison_bars(json_path, title_prefix, out_name):
+    """
+    Reads the JSON run_surrogate_comparison.py / run_surrogate_comparison_v3.py
+    writes out (surrogate_comparison_results.json / _v3.json) -- one dict per
+    architecture, each with mean/median/max_rel_l2, n_parameters,
+    inference_ms_per_sample, training_wall_clock_seconds (eval_utils.py's
+    full_evaluation() output plus the training time run_surrogate_comparison
+    adds). Does NOT invent numbers if the file doesn't exist yet -- unlike
+    fno_validation_comparison() above (which has real logged v1/v2 numbers
+    already in hand), this comparison hasn't been run yet as of this commit,
+    so there is nothing honest to hardcode as a fallback; this just skips
+    cleanly via the safe() wrapper until you've actually run the training
+    script and have a real results file to plot.
+    """
+    import json
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"{json_path} not found -- run run_surrogate_comparison"
+                            f"{'_v3' if 'v3' in json_path else ''}.py first")
+    with open(json_path) as f:
+        results = json.load(f)
+
+    names = list(results.keys())
+    mean_l2 = [results[n]["mean_rel_l2"] for n in names]
+    median_l2 = [results[n]["median_rel_l2"] for n in names]
+    max_l2 = [results[n]["max_rel_l2"] for n in names]
+    infer_ms = [results[n]["inference_ms_per_sample"] for n in names]
+    n_params = [results[n]["n_parameters"] for n in names]
+
+    fig, axes = plt.subplots(1, 3, figsize=(6 * len(names) / 2 + 6, 5.5))
+    x = np.arange(len(names))
+    w = 0.27
+    axes[0].bar(x - w, mean_l2, w, label="mean")
+    axes[0].bar(x, median_l2, w, label="median")
+    axes[0].bar(x + w, max_l2, w, label="max")
+    axes[0].set_xticks(x); axes[0].set_xticklabels(names, rotation=30, ha="right", fontsize=8)
+    axes[0].set_ylabel("relative L2 error")
+    axes[0].set_title("Accuracy (held-out test set)")
+    axes[0].legend(fontsize=8)
+
+    axes[1].bar(x, infer_ms, color="tab:green")
+    axes[1].set_xticks(x); axes[1].set_xticklabels(names, rotation=30, ha="right", fontsize=8)
+    axes[1].set_ylabel("ms / sample")
+    axes[1].set_title("Inference speed\n(priority #1 per the comparison spec:\nShapley/Blotto call volume)")
+
+    axes[2].bar(x, n_params, color="tab:purple")
+    axes[2].set_xticks(x); axes[2].set_xticklabels(names, rotation=30, ha="right", fontsize=8)
+    axes[2].set_ylabel("parameters")
+    axes[2].set_yscale("log")
+    axes[2].set_title("Model size")
+
+    fig.suptitle(f"{title_prefix}: surrogate architecture comparison "
+                 f"(mean_rel_l2 alone is the spec's Step 5 tie-breaker, NOT the verdict)")
+    plt.tight_layout()
+    savefig(fig, out_name)
 
 
 def fno_training_curves():
@@ -552,6 +698,7 @@ if __name__ == "__main__":
     safe(physics_drawdown_isotropic_vs_anisotropic, "physics_drawdown")
     safe(physics_two_well_interference, "physics_two_well_interference")
     safe(physics_pressure_trajectory_evolution, "physics_trajectory_evolution")
+    safe(dataset_v3_gravity_vs_nogravity, "gravity_segregation")
 
     print("=" * 70)
     print("Generating dataset diagnostics...")
@@ -562,12 +709,18 @@ if __name__ == "__main__":
     safe(lambda: dataset_well_count_histogram("dataset_v2_2000.npz", "v2", "dataset_v2_well_hist.png"), "dataset_v2_well_hist")
     safe(lambda: dataset_permeability_histogram("dataset_2000.npz", "v1", "dataset_v1_field_hist.png"), "dataset_v1_field_hist")
     safe(lambda: dataset_permeability_histogram("dataset_v2_2000.npz", "v2", "dataset_v2_field_hist.png"), "dataset_v2_field_hist")
+    safe(lambda: dataset_v3_field_samples("dataset_v3_1000.npz", "v3 dataset", "dataset_v3_samples.png"), "dataset_v3_samples")
+    safe(lambda: dataset_well_count_histogram("dataset_v3_1000.npz", "v3", "dataset_v3_well_hist.png"), "dataset_v3_well_hist")
+    safe(lambda: dataset_permeability_histogram("dataset_v3_1000.npz", "v3", "dataset_v3_field_hist.png"), "dataset_v3_field_hist")
+    safe(lambda: dataset_v3_field_samples("dataset_v3_gravity_1000.npz", "v3 dataset (gravity)", "dataset_v3_gravity_samples.png"), "dataset_v3_gravity_samples")
 
     print("=" * 70)
     print("Generating FNO validation plots...")
     print("=" * 70)
     safe(fno_validation_comparison, "fno_validation_comparison")
     safe(fno_training_curves, "fno_training_curves")
+    safe(lambda: surrogate_comparison_bars("surrogate_comparison_results.json", "v1", "surrogate_comparison_v1.png"), "surrogate_comparison_v1")
+    safe(lambda: surrogate_comparison_bars("surrogate_comparison_results_v3.json", "v3 (two-phase)", "surrogate_comparison_v3.png"), "surrogate_comparison_v3")
 
     print("=" * 70)
     print("Generating Stage 1 (optimization) plots...")

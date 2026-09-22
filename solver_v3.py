@@ -50,6 +50,53 @@ def total_mobility(Sw, mu_w=1.0, mu_n=5.0, **corey_kwargs):
     return krw / mu_w + krn / mu_n
 
 
+def phase_mobilities(Sw, mu_w=1.0, mu_n=5.0, **corey_kwargs):
+    """lambda_w, lambda_n separately (total_mobility only returns their
+    sum) -- gravity needs them individually since buoyancy pulls each
+    phase differently, weighted by ITS OWN mobility, not the combined one."""
+    krw, krn = corey_relperm(Sw, **corey_kwargs)
+    return krw / mu_w, krn / mu_n
+
+
+def conservative_clip(Sw_raw, phi, Swc, Sor):
+    """
+    Clip to [Swc, 1-Sor] WITHOUT losing/gaining global mass -- found this
+    the hard way under gravity: a buoyant phase piling up against a
+    closed (no-flow) boundary overshoots the physical bound by a small
+    amount EVERY substep (this is a real numerical artifact of first-
+    order upwinding hitting a reflecting wall with converging flux, not a
+    CFL/timestep-size issue -- shrinking dt by 10x barely changed it).
+    Plain np.clip silently deletes that overshoot's mass; compounded over
+    hundreds of substeps this measured out to ~50% total water "lost"
+    over a 150-step run with no wells, which is wrong, not just
+    imprecise. This redistributes exactly what clipping would have
+    deleted into cells that still have headroom, weighted by how much
+    headroom each has, so sum(Sw*phi) is invariant by construction.
+    A no-op (identical to plain np.clip) whenever nothing overshoots, so
+    this is safe to use unconditionally, not just under add_gravity=True.
+    """
+    Sw_clipped = np.clip(Sw_raw, Swc, 1 - Sor)
+    excess_mass = ((Sw_raw - Sw_clipped) * phi).sum()  # >0: mass clipped away, needs putting back
+    if abs(excess_mass) < 1e-12:
+        return Sw_clipped
+
+    if excess_mass > 0:
+        headroom = np.clip((1 - Sor) - Sw_clipped, 0, None)  # cells with room to take more water
+    else:
+        headroom = np.clip(Sw_clipped - Swc, 0, None)  # cells with room to give water back
+
+    weight_total = headroom.sum()
+    if weight_total < 1e-12:
+        # every cell is already saturated at the opposite bound -- nowhere
+        # to put the excess (physically: reservoir is completely full or
+        # completely dry); nothing sound to redistribute into, so fall back
+        # to plain clip rather than divide by ~0 into garbage values
+        return Sw_clipped
+
+    Sw_final = Sw_clipped + (excess_mass * headroom / weight_total) / phi
+    return np.clip(Sw_final, Swc, 1 - Sor)
+
+
 def harmonic_mean(a, b, eps=1e-10):
     return 2.0 * a * b / (a + b + eps)
 
@@ -182,6 +229,7 @@ def solve_two_phase(
     mu_w=1.0, mu_n=5.0, ct=1.0,
     n_pressure_steps=200, pressure_safety=0.4, saturation_safety=0.5,
     save_every=10,
+    add_gravity=False, rho_w=1.0, rho_n=0.7, g=1.0,
     **corey_kwargs
 ):
     """
@@ -190,6 +238,47 @@ def solve_two_phase(
         proportional to local fractional flow at that cell).
     Sw_init: defaults to uniform Swc everywhere (pure injection scenario).
 
+    add_gravity: off by default -- everything below this docstring is
+    IDENTICAL to the pre-gravity solver when add_gravity=False (the extra
+    terms are only computed and only enter source_total/vel_y inside an
+    `if add_gravity:` block), so existing validated behavior (B.1/B.2 in
+    validate_solver_v3.py) is unchanged. When True, adds buoyancy
+    segregation between the wetting (rho_w) and non-wetting (rho_n)
+    phases along the grid's j-axis, which is DEFINED as depth increasing
+    with j (j=0 shallow, j=ny-1 deep) -- this 2D areal grid has no
+    inherent depth axis, so this is a deliberate reinterpretation of the
+    y-axis as vertical, not a 3rd spatial dimension. rho_n < rho_w by
+    default (non-wetting phase buoyant, e.g. CO2 in brine) so it migrates
+    toward j=0 (rises) while wetting phase sinks toward j=ny-1.
+
+    Derivation (phase potential form, Darcy's law per phase alpha):
+        u_alpha = -k*(kr_alpha/mu_alpha) * (dp/dj - rho_alpha*g)
+    Summing phases gives the TOTAL velocity's gravity term (added to
+    vel_y below) and, via its divergence, an explicit source term added
+    to the pressure equation's RHS (same role as well source_total,
+    lagged at the current step's Sw exactly like lambda_total already is
+    -- standard IMPES treatment, not implicit in Sw). This divergence is
+    generally NONZERO only where phase mobilities vary spatially (i.e.
+    near a saturation front) -- a spatially uniform reservoir with
+    uniform gravity does not itself create net flow, only internal
+    counter-current segregation, which is exactly the correct physics.
+
+    KNOWN SIMPLIFICATION: the saturation update below still upwinds fw
+    using the TOTAL velocity's sign at each face (single upwind direction
+    per face). Under strong buoyancy this can differ from the more
+    rigorous treatment of upwinding each phase's flux independently,
+    which allows true counter-current flow (water down, non-wetting
+    phase up) AT THE SAME FACE even when total velocity there is near
+    zero. This solver cannot represent that counter-current case
+    correctly -- it gets the net migration direction right (validated
+    below) but would understate segregation sharpness in a near-zero-
+    total-velocity, strong-gravity regime. Flagging this rather than
+    quietly shipping it as exact.
+
+    Assumes dx=1.0 when add_gravity=True (matches every other call site
+    in this repo already) -- the gravity terms below are only dimensionally
+    consistent with the rest of the discretization at dx=1; asserted below.
+
     Returns: pressure_history, saturation_history (lists of 2D snapshots
     saved every `save_every` pressure steps), final dt_pressure used.
     """
@@ -197,6 +286,8 @@ def solve_two_phase(
         nx, ny = k.shape
     Swc = corey_kwargs.get("Swc", 0.2)
     Sor = corey_kwargs.get("Sor", 0.2)
+    if add_gravity:
+        assert dx == 1.0, "gravity terms are only dimensionally consistent at dx=1.0 in this implementation"
 
     Sw = np.full((nx, ny), Swc) if Sw_init is None else Sw_init.copy()
     p = np.zeros((nx, ny))
@@ -250,13 +341,34 @@ def solve_two_phase(
                 source_total[i, j] -= rates[idx]
                 source_water[i, j] -= rates[idx] * fw_current[i, j]
 
+        if add_gravity:
+            # phase-specific mobilities, face-averaged the SAME way (harmonic
+            # mean) as lambda_total already is -- only the north/south (j-axis
+            # = depth) faces matter, gravity has no x-component here
+            lam_w_cell, lam_n_cell = phase_mobilities(Sw, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
+            _, _, lamw_n_face, _ = face_values_harmonic(lam_w_cell)
+            _, _, lamn_n_face, _ = face_values_harmonic(lam_n_cell)
+            # Q_face[i,j]: gravity-driven Darcy velocity across the face
+            # between (i,j) and (i,j+1), positive = flow toward +j (deeper).
+            # At dx=1 this is simultaneously a valid velocity term (added to
+            # vel_y below) AND, via its face-to-face difference, a valid
+            # source-term contribution to the pressure equation's RHS (same
+            # scale as source_total at dx=1 -- see docstring derivation)
+            Q_face = k_n * (lamw_n_face * rho_w + lamn_n_face * rho_n) * g
+            Q_face_south = np.zeros_like(Q_face); Q_face_south[:, 1:] = Q_face[:, :-1]
+            source_total_with_gravity = source_total + (Q_face_south - Q_face)
+        else:
+            source_total_with_gravity = source_total
+
         p = solve_pressure_implicit(p, k_e, k_w, k_n, k_s, lam_e, lam_w, lam_n, lam_s,
-                                     phi, ct, dt_pressure, source_total, dx=dx)
+                                     phi, ct, dt_pressure, source_total_with_gravity, dx=dx)
 
         p_e2 = np.zeros_like(p); p_e2[:-1, :] = p[1:, :]
         p_n2 = np.zeros_like(p); p_n2[:, :-1] = p[:, 1:]
         vel_x = -k_e * lam_e * (p_e2 - p) / dx
         vel_y = -k_n * lam_n * (p_n2 - p) / dx
+        if add_gravity:
+            vel_y = vel_y + Q_face
 
         dt_sat_max = max_stable_dt_saturation(Sw, vel_x, vel_y, phi, dx, mu_w=mu_w, mu_n=mu_n,
                                                safety=saturation_safety, **corey_kwargs)
@@ -273,8 +385,8 @@ def solve_two_phase(
 
             div_sat_flux = (sat_flux_e - sat_flux_w + sat_flux_n - sat_flux_s) / dx
 
-            Sw = Sw + dt_sub / phi * (-div_sat_flux + source_water)
-            Sw = np.clip(Sw, Swc, 1 - Sor)
+            Sw_raw = Sw + dt_sub / phi * (-div_sat_flux + source_water)
+            Sw = conservative_clip(Sw_raw, phi, Swc, Sor)
 
         if step % save_every == 0:
             pressure_history.append(p.copy())

@@ -149,9 +149,81 @@ def run_b2_backward_compat_test():
     return mass_conserved and monotonic_decay
 
 
+def run_b3_gravity_test():
+    """
+    B.3: added when gravity was added to solver_v3.py (add_gravity=True).
+    Two checks, no wells (closed system, isolates gravity's own behavior
+    from well-source effects entirely):
+      1. Mass conservation: this is the check that CAUGHT a real bug --
+         a buoyant phase piling up against the closed top boundary
+         overshoots the physical saturation bound every substep, and a
+         plain np.clip was silently deleting that overshoot's mass (~50%
+         of total water "lost" over a 150-step run before the fix). Now
+         fixed via conservative_clip (see its docstring). This check
+         must stay in the suite -- it is the only thing that would have
+         caught that bug, and would catch a regression of it.
+      2. Segregation direction: a buoyant (rho_n < rho_w) patch placed at
+         mid-depth must migrate toward shallower j (rise), and must NOT
+         move at all when add_gravity=False (isolates "did gravity do
+         anything" from "did it do the RIGHT thing").
+    """
+    print("\n=== B.3: gravity segregation + mass conservation (no wells) ===")
+    nx, ny = 24, 24
+    k_field = np.full((nx, ny), 0.1)
+    phi_field = np.full((nx, ny), 0.2)
+    Sw_init = np.full((nx, ny), 0.8)
+    Sw_init[:, 10:14] = 0.2  # buoyant (non-wetting-rich) patch at mid-depth
+
+    def mean_depth(Sw):
+        # non-wetting-saturation-weighted centroid along j (depth axis);
+        # lower value = shallower = where the buoyant phase should end up
+        weight = np.clip(0.8 - Sw, 0, None)
+        j = np.arange(ny)
+        return (weight.sum(axis=0) * j).sum() / weight.sum()
+
+    depth_initial = mean_depth(Sw_init)
+
+    _, s_hist_nograv, _ = solve_two_phase(
+        k_field, phi_field, well_locations=[], well_rates=[], well_is_water_injector=[],
+        Sw_init=Sw_init, n_pressure_steps=150, save_every=50, add_gravity=False,
+    )
+    _, s_hist_grav, _ = solve_two_phase(
+        k_field, phi_field, well_locations=[], well_rates=[], well_is_water_injector=[],
+        Sw_init=Sw_init, n_pressure_steps=150, save_every=50,
+        add_gravity=True, rho_w=1.0, rho_n=0.6, g=2.0,
+    )
+
+    mass_initial = (Sw_init * phi_field).sum()
+    mass_nograv = (s_hist_nograv[-1] * phi_field).sum()
+    mass_grav = (s_hist_grav[-1] * phi_field).sum()
+    rel_err_nograv = abs(mass_nograv - mass_initial) / mass_initial
+    rel_err_grav = abs(mass_grav - mass_initial) / mass_initial
+
+    depth_nograv = mean_depth(s_hist_nograv[-1])
+    depth_grav = mean_depth(s_hist_grav[-1])
+
+    print(f"mass conservation, no gravity: rel error = {rel_err_nograv:.8f}")
+    print(f"mass conservation, WITH gravity: rel error = {rel_err_grav:.8f}")
+    print(f"patch depth centroid: initial={depth_initial:.3f}, "
+          f"no-gravity final={depth_nograv:.3f}, with-gravity final={depth_grav:.3f} "
+          f"(should rise, i.e. decrease, only when gravity is on)")
+
+    mass_ok = rel_err_nograv < 1e-9 and rel_err_grav < 1e-9
+    static_without_gravity = abs(depth_nograv - depth_initial) < 1e-6
+    rises_with_gravity = depth_grav < depth_initial - 0.5  # meaningfully shallower, not noise
+
+    print(f"{'PASS' if mass_ok else 'FAIL'}: mass conserved to numerical precision, "
+          f"gravity on or off")
+    print(f"{'PASS' if static_without_gravity else 'FAIL'}: patch does not move without gravity")
+    print(f"{'PASS' if rises_with_gravity else 'FAIL'}: buoyant (rho_n<rho_w) patch rises with gravity on")
+
+    return mass_ok and static_without_gravity and rises_with_gravity
+
+
 if __name__ == "__main__":
     b1_passed = run_b1_buckley_leverett_test()
     b2_result = run_b2_backward_compat_test()
+    b3_passed = run_b3_gravity_test()
 
     print(f"\n{'='*60}\nVALIDATION SUMMARY\n{'='*60}")
     print(f"B.1 Buckley-Leverett: {'PASS' if b1_passed else 'FAIL'}")
@@ -159,8 +231,10 @@ if __name__ == "__main__":
         print("B.2 backward-compat: SKIPPED (solver_v2.py not found)")
     else:
         print(f"B.2 backward-compat: {'PASS' if b2_result else 'FAIL'}")
+    print(f"B.3 gravity segregation: {'PASS' if b3_passed else 'FAIL'}")
 
-    if b1_passed and (b2_result is None or bool(b2_result)):
+    all_passed = b1_passed and (b2_result is None or bool(b2_result)) and b3_passed
+    if all_passed:
         print("\nGATE CLEARED: safe to proceed to Part C (data_gen_v3_multiphase.py)")
     else:
         print("\nGATE NOT CLEARED: per the spec, fix solver_v3.py before generating any "
