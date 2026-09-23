@@ -239,3 +239,8 @@ if __name__ == "__main__":
     else:
         print("\nGATE NOT CLEARED: per the spec, fix solver_v3.py before generating any "
               "dataset or trusting downstream results from it.")
+        import sys
+        sys.exit(1)  # was missing -- this script printed "GATE NOT CLEARED" but still
+        # exited 0, so anything scripting around it (e.g. run_everything.py's
+        # subprocess-returncode check) could not actually detect a failed gate
+        # and would happily continue generating datasets from broken physics

@@ -12,11 +12,27 @@ dataset_v3_*.npz, predicting BOTH final_pressure and final_saturation as a
 solver_v3.py takes a single isotropic k field, not kx/ky, so there is no
 second permeability channel to stack.
 
-U-FNO (the architecture actually motivated by this exact saturation-front
-problem, per the physics spec's Priority 2.4) is deliberately NOT included
-here -- it doesn't exist in this repo yet. This script is what makes
-building it worthwhile in the first place (a real Sw output to test it
-against); building U-FNO itself is the next file, not this one.
+Now includes ccsnet.py's CCSNet (exact fit -- its 3 static input channels
+and dual pressure/saturation heads already match this dataset, no
+adaptation needed beyond unwrapping its dict output into a stacked
+tensor) and an ADAPTED version of ufno.py's UFNO (see
+train_ufno_saturation_only()'s docstring for exactly what was changed and
+why its result is reported separately, not in the main table -- it was
+designed for one-step front advection with a previous-saturation input
+this final-frame dataset doesn't have).
+
+Still not included: nested_fno.py, runet_recurrent.py, pi_convlstm.py,
+e2c.py, gns.py (all need trajectory data -- intermediate saturation
+snapshots -- that data_gen_v3_multiphase.py doesn't currently save, even
+though solve_two_phase already returns them internally), deeponet.py and
+hybrid_deeponet_kan.py (need sensor/off-grid query data, a different
+dataset shape entirely), finn.py (needs the conservation-law-structured
+static/dynamic split its own train_step expects), near_well_hybrid.py
+(needs patch-extracted near-well data). All of these currently only pass
+their own file's standalone shape/gradient-flow check on synthetic random
+data (run e.g. `python nested_fno.py`) -- that confirms the architecture
+is implemented correctly, not that it has been trained or compared on any
+real reservoir data yet.
 
 Physics loss here penalizes the residual on the PRESSURE channel only
 (pred[:, 0:1]) -- physics_residual_loss encodes the elliptic pressure
@@ -47,6 +63,8 @@ from neuralop.models import FNO
 from unet_baseline import UNetSurrogate
 from fno_physics_informed import physics_residual_loss
 from eval_utils import full_evaluation, count_parameters
+from ccsnet import CCSNet
+from ufno import UFNO
 
 DATASET_PATH = sys.argv[1] if len(sys.argv) > 1 else "dataset_v3_1000.npz"
 SPLIT_PATH = "fixed_split.npz"
@@ -178,11 +196,100 @@ def train_physics_informed_fno_v3(device, physics_weight):
     return model, time.time() - t0
 
 
-ARCHITECTURES = {"plain_fno": train_plain_fno, "unet_baseline": train_unet}
+class CCSNetWrapper(nn.Module):
+    """CCSNet (ccsnet.py) returns a dict {"pressure":..., "saturation":...}
+    -- eval_utils.full_evaluation calls model(x) and expects a plain tensor
+    directly comparable to y's (B,2,H,W) shape, same as every other
+    architecture here. This wrapper is the ONLY change needed: CCSNet's
+    in_ch=3 (kx, ky, well_mask) already matches this dataset's 3 static
+    channels exactly (v3 is isotropic, so "kx, ky" here just means
+    permeability, porosity like everywhere else in this script), and its
+    two heads already predict exactly pressure and saturation -- nothing
+    about the model itself needed adapting, unlike UFNO below."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = CCSNet(in_ch=3, width=16)
+
+    def forward(self, x):
+        out = self.model(x)
+        return torch.cat([out["pressure"], out["saturation"]], dim=1)
+
+
+def train_ccsnet(device):
+    train_loader, _ = make_loader("train", shuffle=True)
+    model = CCSNetWrapper().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+    t0 = time.time()
+    for epoch in range(EPOCHS):
+        model.train()
+        for x, y, perm_raw, mask_raw in train_loader:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            pred = model(x)
+            loss = F.mse_loss(pred, y)
+            loss.backward()
+            opt.step()
+        scheduler.step()
+    return model, time.time() - t0
+
+
+def train_ufno_saturation_only(device):
+    """
+    ADAPTED, not a straight drop-in -- flagging this explicitly rather than
+    quietly changing what UFNO means. ufno.py's UFNO is designed for
+    in_ch=4 (kx, ky, well_mask, S_w_prev) predicting S_w one step ahead --
+    a front-ADVECTION model that needs a previous-saturation snapshot as
+    input. dataset_v3_*.npz only has the FINAL saturation field (no
+    intermediate trajectory saved), so there is no S_w_prev to give it.
+
+    This trains it instead as a final-state regressor over the SAME 3
+    static channels as everything else here (in_ch=3, out_ch=1,
+    saturation only) -- i.e. testing only the "does interleaving FNO with
+    U-Net blocks sharpen a predicted saturation FIELD" hypothesis, not the
+    paper's actual "does it sharpen a one-step ADVECTION update"
+    hypothesis. Real UFNO validation needs a trajectory dataset (solve_two_
+    phase already returns pressure_history/saturation_history -- data_gen_
+    v3_multiphase.py just doesn't save them) and a one-step-ahead training
+    loop. Until that exists, treat this entry as "U-Net+FNO vs plain FNO
+    on final-state saturation," not as a validated U-FNO result.
+
+    Because it outputs only 1 channel (saturation), it CANNOT be scored by
+    the same 2-channel full_evaluation() call as the rest -- it's evaluated
+    separately against y[:, 1:2] only, and reported with rel_l2 that is NOT
+    on the same scale/basis as the other architectures' mean_rel_l2 (its
+    task is strictly easier: one channel, not two). Don't rank it directly
+    against the table without accounting for that.
+    """
+    train_loader, _ = make_loader("train", shuffle=True)
+    model = UFNO(in_ch=3, out_ch=1, width=24, modes1=16, modes2=16).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+    t0 = time.time()
+    for epoch in range(EPOCHS):
+        model.train()
+        for x, y, perm_raw, mask_raw in train_loader:
+            x, y_sat = x.to(device), y[:, 1:2].to(device)
+            opt.zero_grad()
+            pred = model(x)
+            loss = F.mse_loss(pred, y_sat)
+            loss.backward()
+            opt.step()
+        scheduler.step()
+    return model, time.time() - t0
+
+
+ARCHITECTURES = {"plain_fno": train_plain_fno, "unet_baseline": train_unet, "ccsnet": train_ccsnet}
 for w in PHYSICS_WEIGHTS:
     ARCHITECTURES[f"physics_informed_fno_w{w}"] = (
         lambda device, w=w: train_physics_informed_fno_v3(device, physics_weight=w)
     )
+# ufno_saturation_only deliberately excluded from ARCHITECTURES / the main
+# loop below -- it needs the separate 1-channel eval path, run_full_
+# comparison() handles it as a special case after the main table.
 
 
 def run_full_comparison():
@@ -218,6 +325,32 @@ def run_full_comparison():
     for name, r in results.items():
         print(f"{name:<32}{r['mean_rel_l2']:<14.4f}{r['n_parameters']:<12,}"
               f"{r['inference_ms_per_sample']:<12.2f}{r['training_wall_clock_seconds']:<10.0f}")
+
+    print(f"\n{'='*76}\nufno_saturation_only (SEPARATE -- 1-channel task, not comparable to the table above)\n{'='*76}")
+    model, train_time = train_ufno_saturation_only(device)
+
+    class SaturationOnlyEvalWrapper:
+        def __init__(self, loader):
+            self.loader = loader
+
+        def __iter__(self):
+            for x, y, perm_raw, mask_raw in self.loader:
+                yield x, y[:, 1:2]
+
+    ufno_results = full_evaluation(model, SaturationOnlyEvalWrapper(test_loader), device)
+    ufno_results["training_wall_clock_seconds"] = train_time
+    ufno_results["NOTE"] = ("saturation channel only, adapted from ufno.py's designed 4-channel " 
+                             "front-advection input to this dataset's 3 static channels -- see " 
+                             "train_ufno_saturation_only()'s docstring. NOT directly comparable to " 
+                             "the 2-channel mean_rel_l2 numbers above.")
+    print(f"ufno_saturation_only: mean_rel_l2={ufno_results['mean_rel_l2']:.4f} (saturation only), "
+          f"params={ufno_results['n_parameters']:,}, "
+          f"inference={ufno_results['inference_ms_per_sample']:.2f}ms, "
+          f"train_time={train_time:.0f}s")
+
+    with open("surrogate_comparison_results_v3.json", "w") as f:
+        json.dump({**results, "ufno_saturation_only": ufno_results}, f, indent=2)
+    print("\nupdated surrogate_comparison_results_v3.json (now includes ufno_saturation_only)")
 
     print("\nCheck first: physics_informed_fno_w0.0's mean_rel_l2 should match "
           "plain_fno's almost exactly (same required reduction property as v1's "
