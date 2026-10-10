@@ -230,6 +230,7 @@ def solve_two_phase(
     n_pressure_steps=200, pressure_safety=0.4, saturation_safety=0.5,
     save_every=10,
     add_gravity=False, rho_w=1.0, rho_n=0.7, g=1.0,
+    p_init=None, t_end=None, return_time=False,
     **corey_kwargs
 ):
     """
@@ -290,7 +291,12 @@ def solve_two_phase(
         assert dx == 1.0, "gravity terms are only dimensionally consistent at dx=1.0 in this implementation"
 
     Sw = np.full((nx, ny), Swc) if Sw_init is None else Sw_init.copy()
-    p = np.zeros((nx, ny))
+    # Staged runs (multi-year games): p_init carries pressure across stages,
+    # t_end stops at a fixed simulated time (last step shortened to land on it),
+    # return_time adds the elapsed simulated time as a 4th return value. All three
+    # default to the old behavior, so existing callers are unchanged.
+    p = np.zeros((nx, ny)) if p_init is None else np.asarray(p_init, dtype=np.float64).copy()
+    t_elapsed = 0.0
     k_e, k_w, k_n, k_s = face_values_harmonic(k)
 
     wi = np.array([loc[0] for loc in well_locations], dtype=int)
@@ -306,6 +312,11 @@ def solve_two_phase(
         lam_e, lam_w, lam_n, lam_s = face_values_harmonic(lam_total)
 
         dt_pressure = max_stable_dt_pressure(k, lam_total, phi, 1.0, ct, dx, safety=pressure_safety)
+        if t_end is not None:
+            remaining = t_end - t_elapsed
+            if remaining <= 1e-12:
+                break
+            dt_pressure = min(dt_pressure, remaining)
 
         # NOTE on a design decision, found the hard way: the spec's stated
         # pressure equation is ELLIPTIC (no accumulation/dp-dt term at all),
@@ -362,6 +373,7 @@ def solve_two_phase(
 
         p = solve_pressure_implicit(p, k_e, k_w, k_n, k_s, lam_e, lam_w, lam_n, lam_s,
                                      phi, ct, dt_pressure, source_total_with_gravity, dx=dx)
+        t_elapsed += dt_pressure
 
         p_e2 = np.zeros_like(p); p_e2[:-1, :] = p[1:, :]
         p_n2 = np.zeros_like(p); p_n2[:, :-1] = p[:, 1:]
@@ -395,6 +407,8 @@ def solve_two_phase(
     pressure_history.append(p.copy())
     saturation_history.append(Sw.copy())
 
+    if return_time:
+        return pressure_history, saturation_history, dt_pressure, t_elapsed
     return pressure_history, saturation_history, dt_pressure
 
 
