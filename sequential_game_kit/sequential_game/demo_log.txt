@@ -1,0 +1,13 @@
+mode  info     welfare mean     std   per-seed
+nash  prior           168.1   167.0   [263.0, -192.0, 246.0, 310.0, 215.0, 167.0]
+nash  learn           180.5   139.2   [261.0, -115.0, 246.0, 310.0, 215.0, 167.0]
+nash  oracle          198.3   129.7   [261.0, -59.0, 243.0, 364.0, 215.0, 167.0]
+coop  prior           181.0   138.7   [261.0, -114.0, 246.0, 310.0, 215.0, 167.0]
+coop  learn           168.3   130.1   [223.0, -114.0, 246.0, 272.0, 215.0, 167.0]
+coop  oracle          190.1   119.6   [261.0, -59.0, 246.0, 310.0, 215.0, 167.0]
+
+cost of non-cooperation (coop - nash welfare), info=prior: mean 12.9  per-seed [-2.0, 78.8, 0.2, 0.2, -0.0, 0.1]
+cost of non-cooperation (coop - nash welfare), info=learn: mean -12.2  per-seed [-37.4, 1.7, 0.2, -37.9, -0.0, 0.1]
+cost of non-cooperation (coop - nash welfare), info=oracle: mean -8.2  per-seed [0.4, 0.4, 3.3, -53.9, 0.3, 0.0]
+value of learning (nash): learn - prior = 12.4  | value of perfect info: oracle - learn = 17.8
+value of learning (coop): learn - prior = -12.7  | value of perfect info: oracle - learn = 21.8
