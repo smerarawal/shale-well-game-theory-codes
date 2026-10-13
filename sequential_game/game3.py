@@ -83,6 +83,10 @@ class Cfg:
     # ---- v4 belief switches (defaults reproduce v3 exactly)
     temper: float = 1.0        # exponent beta on the likelihood (beta<1 = discount correlated information)
     model_err: float = 0.0     # relative model error kappa: sigma_eff^2 = sigma_lik^2 + (kappa*p_pred)^2
+    # ---- v5 policy / solver switches (defaults reproduce v4 exactly)
+    inj_price: float = 0.0     # per-unit injected volume charge seen by Nash players only (a transfer: welfare ignores it)
+    alloc: bool = False        # permit split into equal fixed per-operator allowances (no pro-rata race)
+    br_rounds: int = 3         # max rounds of iterated best response
 
     def __post_init__(self):
         if self.layout != "v2":
@@ -118,14 +122,23 @@ def play_stage(model, geo, state, wells, rates, new_wells, cfg):
     gross[o], drill[o], pen (scalar field penalty, m=1), share[o], pmax."""
     cum = state.get("cum", 0.0)
     rates = tuple(rates)
-    if np.isfinite(cfg.cap_total):  # shared permit: curtail every operator pro rata if it would be exceeded
+    cum_o = np.asarray(state.get("cum_o", np.zeros(cfg.n_ops)), float)
+    if np.isfinite(cfg.cap_total):  # shared permit
         nw = np.zeros(cfg.n_ops)
         for o, _, _ in wells:
             nw[o] += 1
-        req = float(sum(rates[o] * cfg.stage_time * nw[o] for o in range(cfg.n_ops)))
-        allowed = max(0.0, cfg.cap_total - cum)
-        f = 1.0 if (req <= allowed + 1e-12 or req <= 0) else allowed / req
-        rates = tuple(r * f for r in rates)
+        if cfg.alloc:  # equal fixed allowances: each operator is curtailed only by its own cumulative volume
+            fs = []
+            for o in range(cfg.n_ops):
+                req_o = rates[o] * cfg.stage_time * nw[o]
+                allow_o = max(0.0, cfg.cap_total / cfg.n_ops - cum_o[o])
+                fs.append(1.0 if (req_o <= allow_o + 1e-12 or req_o <= 0) else allow_o / req_o)
+            rates = tuple(r * f for r, f in zip(rates, fs))
+        else:  # shared pool: curtail every operator pro rata if it would be exceeded
+            req = float(sum(rates[o] * cfg.stage_time * nw[o] for o in range(cfg.n_ops)))
+            allowed = max(0.0, cfg.cap_total - cum)
+            f = 1.0 if (req <= allowed + 1e-12 or req <= 0) else allowed / req
+            rates = tuple(r * f for r in rates)
     active = [(i, j, max(rates[o], 1e-6)) for o, i, j in wells]
     nxt, t = model.advance(geo, state, active)
     gross = np.zeros(cfg.n_ops)
@@ -147,11 +160,12 @@ def play_stage(model, geo, state, wells, rates, new_wells, cfg):
         share = vol / vol.sum() if vol.sum() > 1e-9 else np.zeros(cfg.n_ops)
     nxt = dict(nxt)
     nxt["cum"] = cum + float(vol.sum())
+    nxt["cum_o"] = cum_o + vol
     return nxt, {"gross": gross, "drill": drill, "pen": pen, "share": share, "pmax": pmax, "vol": vol}
 
 
-def payoff(c, cfg, mult=1.0):
-    return c["gross"] - c["drill"] - mult * c["pen"] * c["share"]
+def payoff(c, cfg, mult=1.0, price=0.0):
+    return c["gross"] - c["drill"] - mult * c["pen"] * c["share"] - price * c["vol"]
 
 
 def wquantile(vals, w, q):
@@ -252,7 +266,7 @@ class BeliefV3(Belief):
         self.n_rejuv += 1
 
 
-def joint_value(model, cfg, belief, wells, rates, new_wells, t, mult):
+def joint_value(model, cfg, belief, wells, rates, new_wells, t, mult, price=0.0):
     """Expected discounted payoff vector of (rates, new_wells) now, rates held afterwards,
     plus extrapolated continuation. Simulated on every belief particle."""
     H = min(cfg.horizon, cfg.T - t)
@@ -271,7 +285,7 @@ def joint_value(model, cfg, belief, wells, rates, new_wells, t, mult):
         acc, r = np.zeros(cfg.n_ops), None
         for h in range(H):
             st, c = play_stage(model, geo, st, allw, rates, new_wells if h == 0 else (), cfg)
-            r = payoff(c, cfg, mult)
+            r = payoff(c, cfg, mult, price)
             acc += cfg.gamma ** h * r
         rest = cfg.T - t - H
         if cfg.extrap and rest > 0:
@@ -294,6 +308,7 @@ def choose(model, cfg, belief, wells, prev_rates, n_new, t, mode):
     if cfg.pilot_rate is not None and t == 0:  # ramp-up rule
         rates_allowed = tuple(r for r in rates_allowed if r <= cfg.pilot_rate + 1e-9)
     m_dec = cfg.liab_mult if mode == "nash" else 1.0
+    p_dec = cfg.inj_price if mode == "nash" else 0.0   # coop planner: a price is a transfer, it cancels
     cache = {}
 
     def val(j):
@@ -301,7 +316,7 @@ def choose(model, cfg, belief, wells, prev_rates, n_new, t, mode):
         if key not in cache:
             rates = tuple(a[0] for a in j)
             new = tuple((o, a[1][0], a[1][1]) for o, a in enumerate(j) if a[1] is not None)
-            cache[key] = joint_value(model, cfg, belief, wells, rates, new, t, m_dec)
+            cache[key] = joint_value(model, cfg, belief, wells, rates, new, t, m_dec, p_dec)
         return cache[key]
 
     opts = [options_for(o, wells, rates_allowed, cfg, n_new) for o in ops]
@@ -317,7 +332,7 @@ def choose(model, cfg, belief, wells, prev_rates, n_new, t, mode):
         return best
     # Nash by iterated best response, start from "continue previous rate, no drill"
     joint = [(min(rates_allowed, key=lambda r: abs(r - prev_rates[o])), None) for o in ops]
-    for _ in range(3):
+    for _ in range(cfg.br_rounds):
         changed = False
         for o in ops:
             others = [joint[q][1] for q in ops if q != o]
