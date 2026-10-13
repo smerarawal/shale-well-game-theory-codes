@@ -80,6 +80,9 @@ class Cfg:
     rejuv_frac: float = 0.5
     jitter: float = 0.1
     stage_time: float = 1.0
+    # ---- v4 belief switches (defaults reproduce v3 exactly)
+    temper: float = 1.0        # exponent beta on the likelihood (beta<1 = discount correlated information)
+    model_err: float = 0.0     # relative model error kappa: sigma_eff^2 = sigma_lik^2 + (kappa*p_pred)^2
 
     def __post_init__(self):
         if self.layout != "v2":
@@ -190,6 +193,15 @@ class Belief:
     n_rejuv = 0
 
 
+def loglik(obs, pred, cfg):
+    """Gaussian log-likelihood of the observations; v4 adds tempering and a relative model-error term
+    (both default off, which gives exactly the v3 expression)."""
+    if cfg.model_err > 0:
+        var = cfg.sigma_lik ** 2 + (cfg.model_err * np.asarray(pred)) ** 2
+        return -cfg.temper * float(np.sum((obs - pred) ** 2 / (2 * var)))
+    return -cfg.temper * np.sum((obs - pred) ** 2) / (2 * cfg.sigma_lik ** 2)
+
+
 class BeliefV3(Belief):
     """Particle filter with exact re-weighting and rejuvenation. When ESS < rejuv_frac*K the
     particles are resampled (systematic), each is jittered (log-normal on the permeability
@@ -209,7 +221,7 @@ class BeliefV3(Belief):
 
     def update(self, obs, wells, cfg):
         pred = [np.array([s["p"][i, j] for _, i, j in wells]) for s in self.states]
-        logl = np.array([-np.sum((obs - p) ** 2) / (2 * cfg.sigma_lik ** 2) for p in pred])
+        logl = np.array([loglik(obs, p, cfg) for p in pred])
         w = self.w * np.exp(logl - logl.max())
         w = np.maximum(w / w.sum(), 1e-12)
         self.w = w / w.sum()
@@ -232,7 +244,7 @@ class BeliefV3(Belief):
                 st, _ = play_stage(self.model, ng, st, wells, rates, new, cfg)
                 if obs is not None:
                     pred = np.array([st["p"][a, b] for _, a, b in wells])
-                    ll += -np.sum((obs - pred) ** 2) / (2 * cfg.sigma_lik ** 2)
+                    ll += loglik(obs, pred, cfg)
             geos.append(ng), states.append(st), logls.append(ll)
         logls = np.array(logls)
         w = np.exp(logls - logls.max())
@@ -343,6 +355,20 @@ def resolve_action(op, rate, drill, wells, cfg, n_new, joint):
     return (rate, sites[0] if sites else None)
 
 
+def predictive_diag(belief, obs, wells, cfg):
+    """Calibration of the belief's one-step-ahead predictive distribution (before seeing obs).
+    z_rms ~ 1 and z_cov90 ~ 0.9 mean calibrated; pm_* is the predictive interval of the field peak pressure."""
+    P = np.array([[s["p"][i, j] for _, i, j in wells] for s in belief.states])
+    w = np.asarray(belief.w)
+    mu = w @ P
+    var = w @ (P - mu) ** 2 + cfg.sigma_obs ** 2
+    z = (obs - mu) / np.sqrt(var)
+    pm = [float(s["p"].max()) for s in belief.states]
+    return {"z_rms": round(float(np.sqrt(np.mean(z ** 2))), 3), "z_cov90": round(float(np.mean(np.abs(z) < 1.645)), 3),
+            "pm_mean": round(float(w @ np.array(pm)), 3), "pm_q05": round(wquantile(pm, w, 0.05), 3),
+            "pm_q95": round(wquantile(pm, w, 0.95), 3)}
+
+
 def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None, prefix=None,
                 pool_seeds=(11, 12, 13, 14)):
     """force={t: {op: (rate, drill_flag)}} overrides one operator's action at stage t AFTER planning
@@ -350,7 +376,7 @@ def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None
     instead of planning (used by the one-shot-deviation check)."""
     rng = np.random.default_rng(seed)
     geos = [true_geo] if info == "oracle" else prior_geos
-    BeliefCls = BeliefV3 if (cfg.belief_mode == "v3" and info != "oracle") else Belief
+    BeliefCls = BeliefV3 if (cfg.belief_mode in ("v3", "v4") and info != "oracle") else Belief
     belief = BeliefCls(geos, model, cfg, pool_seeds=pool_seeds, seed=seed)
     true_state = model.initial_state(cfg.n)
     wells = tuple((o,) + tuple(cfg.init_sites[o]) for o in range(cfg.n_ops))
@@ -383,10 +409,12 @@ def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None
         pmax_hist.append(c["pmax"])
         viol += max(0.0, c["pmax"] - cfg.p_cap)
         belief.advance(wells, rates, new, cfg)
+        diag = {}
         if info == "learn":
             obs = np.array([true_state["p"][i, j] for _, i, j in wells]) + rng.normal(0, cfg.sigma_obs, len(wells))
+            diag = predictive_diag(belief, obs, wells, cfg)   # BEFORE the update: honest predictive check
             belief.update(obs, wells, cfg)
-        log.append({"stage": t, "rates": list(rates), "new_wells": [list(w) for w in new],
+        log.append({**diag, "stage": t, "rates": list(rates), "new_wells": [list(w) for w in new],
                     "joint": [[a[0], list(a[1]) if a[1] is not None else None] for a in joint],
                     "reward": r.round(2).tolist(), "pmax": round(c["pmax"], 2),
                     "ess": round(belief.ess(), 2), "mult_hat": round(belief.mult_mean(), 3),
