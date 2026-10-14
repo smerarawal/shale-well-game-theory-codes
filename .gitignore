@@ -1,3 +1,10 @@
-*.npz 
-*.pt 
-*.png 
+*.npz
+*.pt
+*.png
+!docs/figures/*.png
+__pycache__/
+*.pyc
+*_results/
+seq*_results/
+kit/
+*.zip
