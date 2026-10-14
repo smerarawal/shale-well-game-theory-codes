@@ -38,7 +38,6 @@ def main():
     ap.add_argument("--n_workers", type=int, default=0, help="0 = number of visible GPUs (min 1)")
     ap.add_argument("--steps", type=int, default=12)
     ap.add_argument("--only", nargs="*", default=None)
-    ap.add_argument("--exclude", nargs="*", default=None)
     a = ap.parse_args()
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,7 +70,7 @@ def main():
 
     rows, failures = {}, []
     for arch in ARCH_COST:
-        if (a.only and arch not in a.only) or (a.exclude and arch in a.exclude):
+        if a.only and arch not in a.only:
             continue
         try:
             if dev.type == "cuda":

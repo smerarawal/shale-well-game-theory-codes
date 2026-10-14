@@ -75,7 +75,6 @@ def main():
     ap.add_argument("--stages", default="data,ood_data,preflight,train,benchmark,ood_eval,report")
     ap.add_argument("--quick", action="store_true", help="tiny smoke configuration (minutes, CPU ok)")
     ap.add_argument("--only", nargs="*", default=None, help="restrict architectures (debug)")
-    ap.add_argument("--exclude", nargs="*", default=None, help="skip these architectures, e.g. --exclude gns_traj")
     ap.add_argument("--n_samples", type=int, default=4000)
     ap.add_argument("--n_ood", type=int, default=200)
     ap.add_argument("--epochs", type=int, default=300)
@@ -96,7 +95,6 @@ def main():
     os.makedirs(out, exist_ok=True)
     import_prev(a.prev, out)
     only = ["--only", *a.only] if a.only else []
-    only += ["--exclude", *a.exclude] if a.exclude else []
 
     import torch
     n_gpu = torch.cuda.device_count()

@@ -320,7 +320,6 @@ def main():
     ap.add_argument("--ckpt_every", type=int, default=10)
     ap.add_argument("--stages", default="sweep,final")
     ap.add_argument("--only", nargs="*", default=None)
-    ap.add_argument("--exclude", nargs="*", default=None, help="architectures to skip")
     ap.add_argument("--worker", type=int, default=0)
     ap.add_argument("--n_workers", type=int, default=1)
     ap.add_argument("--time_budget_hours", type=float, default=0.0, help="0 = unlimited")
@@ -356,12 +355,7 @@ def main():
         ctx["Y"][s] = torch.from_numpy(y[idx[s]]).to(dev)
     ctx["YT"]["train"] = torch.from_numpy(yt[idx["train"]]).to(dev)
 
-    est_path = os.path.join(out, "estimate.json")
-    if os.path.exists(est_path):  # balance workers with the MEASURED per-epoch cost from the preflight
-        for k, v in json.load(open(est_path))["rows"].items():
-            if k in ARCH_COST:
-                ARCH_COST[k] = v["epoch_sec"]
-    archs = [a for a in ARCH_COST if (not args.only or a in args.only) and a not in (args.exclude or [])]
+    archs = [a for a in ARCH_COST if (not args.only or a in args.only)]
     buckets, loads = assign_archs(archs, args.n_workers, args.seeds, args.epochs, args.pilot_epochs, args.slow_seeds)
     mine = buckets[args.worker]
     log(args.worker, f"device={dev} data N={N} {H}x{W} T={T} split={len(idx['train'])}/{len(idx['val'])}/{len(idx['test'])}")

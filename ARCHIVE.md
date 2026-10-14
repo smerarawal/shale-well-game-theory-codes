@@ -1,12 +1,13 @@
 # Archived code
 
-Everything below was removed from main but is preserved. Tag `pre-cleanup` is the full pre-cleanup tree.
+The complete repository before cleanup is available on branch `archive/pre-cleanup-snapshot` and tag `pre-cleanup-current-2026-10-14` (commit `6142ddf`). The supplied bundle also includes its original `pre-cleanup` tag and archive branches, which predate the current snapshot.
 
-| branch | what it holds |
+| Branch | Contents |
 |---|---|
-| `archive/physics-fno-v1-v2` | Physics v1/v2 (single-phase diffusion), the first FNO surrogate, dataset generators for them, stage-1 greedy well placement, and the early visualisations. |
-| `archive/coalition-games-blotto-shapley` | Cooperative-game work on the v1 FNO: Shapley, core/nucleolus, Blotto allocation, submodularity. Revive this when you build the 3-operator (core/Shapley) extension. |
-| `archive/surrogate-scaffolds-v1-v3` | Per-architecture scaffolds and the old comparison drivers. Superseded by the single model zoo (fair_run/model_zoo_v3.py / v4.py), which holds all 16 architectures. |
-| `archive/sequential-game-v1-v2` | Game engines v1 and v2 and their studies. Their headline results were retracted (collapsing belief, H=2 planner), so they are kept only for provenance. |
+| `archive/physics-fno-v1-v2` | Physics v1/v2, first FNO surrogate, data generators, stage-1 well placement, and early figures. |
+| `archive/coalition-games-blotto-shapley` | Cooperative-game work on the v1 FNO: Shapley, core/nucleolus, Blotto allocation, submodularity, and related analyses. |
+| `archive/surrogate-scaffolds-v1-v3` | Standalone architecture scaffolds and earlier comparison harnesses. |
+| `archive/sequential-game-v1-v2` | Earlier game engines and studies preserved for provenance. |
+| `archive/sequential-game-packages` | Exported sequential-game kit folders and ZIP snapshot from commit `6142ddf`; the active v3-v5 code is in `sequential_game/`. |
 
-To use one: `git switch archive/<name>`.
+To use an archive branch, check it out with `git switch <branch>`. Archive branches are local until explicitly pushed.

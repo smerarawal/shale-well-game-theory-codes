@@ -63,9 +63,3 @@ Data generation (~1 h, CPU only) can run in a CPU-only notebook first: `!python 
 - E2C and the *_traj models use intermediate-time supervision the others do not; each has a final-frame-only twin except E2C.
 - Estimates before the preflight are extrapolated; the preflight replaces them with measurements.
 - Not included: the downstream Shapley/Blotto check against the real solver.
-
-## Cost note (from the measured preflight on 2 x T4)
-Measured total ~36 GPU-hours; `gns_traj` alone is ~12.7 h of that and is not a contender. To drop it (or any model):
-`python run_all.py --exclude gns_traj` (with the patched code; `patch_exclude.py` applies it to an older clone). Workers now balance
-load using the measured per-epoch costs in `final_run/estimate.json`. Without `gns_traj`: ~23.6 GPU-h, ~12 h wall on two workers.
-When re-running inside an already-running session, pass `--budget_hours <hours left before the 12 h limit, minus ~0.5>` (the budget clock restarts with each launch).
