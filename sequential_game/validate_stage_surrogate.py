@@ -105,7 +105,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--train_data", default=None, help="held-out test episodes of this file are used")
-    ap.add_argument("--eval_data", default=None, help="game geologies (all episodes)")
+    ap.add_argument("--eval_data", default=None, help="evaluation episodes (all used), e.g. game geologies or SPE10")
+    ap.add_argument("--eval_name", default="game geologies true_geo(0..23)", help="label for the eval data in the report")
     ap.add_argument("--tol", type=float, default=2.0, help="penalty-error tolerance in welfare units (proposal)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -130,7 +131,7 @@ def main():
         run(net, d, te, "held-out test episodes (random policies)", a.tol, lines, out)
     if a.eval_data:
         d = load(a.eval_data)
-        run(net, d, np.arange(d["permeability"].shape[0]), "game geologies true_geo(0..23)", a.tol, lines, out)
+        run(net, d, np.arange(d["permeability"].shape[0]), a.eval_name, a.tol, lines, out)
     txt = "\n".join(lines)
     print(txt)
     if a.out:

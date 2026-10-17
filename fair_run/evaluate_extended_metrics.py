@@ -158,6 +158,7 @@ def main():
     ap.add_argument("--archs", nargs="+", default=DEFAULT_ARCHS)
     ap.add_argument("--p_thresh", type=float, default=5.0)
     ap.add_argument("--cap", type=float, default=6.0)
+    ap.add_argument("--extra_ood_dir", default=None, help="extra ood_*.npz sets (e.g. SPE10), read in addition to <out>/ood")
     ap.add_argument("--report_dir", default=None, help="default: <out>/report (use a writable dir on Kaggle)")
     a = ap.parse_args()
 
@@ -169,7 +170,10 @@ def main():
     x, y, _, idx, _, _, _ = load_data(os.path.join(a.out, "data", "dataset.npz"))
     te = idx["test"]
     sets = {"test": (x[te], y[te])}
-    for p in sorted(glob.glob(os.path.join(a.out, "ood", "ood_*.npz"))):
+    ood_files = sorted(glob.glob(os.path.join(a.out, "ood", "ood_*.npz")))
+    if a.extra_ood_dir:
+        ood_files += sorted(glob.glob(os.path.join(a.extra_ood_dir, "ood_*.npz")))
+    for p in ood_files:
         if p.endswith(".tmp.npz") or "chunks" in p:
             continue
         d = np.load(p)
