@@ -14,11 +14,22 @@ Design (see SURROGATE_HANDOFF.md sections 6-8):
   * units stay solver units; elapsed time returned is exactly stage_time.
 
 The backbone is a small U-Net ("unet") or a CCSNet-style two-decoder U-Net ("ccs").
+
+Hybrid modes (physics_prior.py = the solver's own implicit pressure step, batched in torch):
+  hybrid="none"    pure learned model (above).
+  hybrid="prior"   p_a = physics pressure advance with lambda frozen at Sw_in is fed to the net as
+                   an extra channel; the net predicts the RESIDUAL:  p_out = p_a + dp.
+  hybrid="prior2"  as "prior", then the net's own Sw_out is used to re-solve pressure with lambda
+                   following Sw_in -> Sw_out:  p_out = p_b(Sw_out_pred) + dp.  Differentiable, so it
+                   trains end to end; pressure then depends on the true k/phi geometry through
+                   physics and on the learned saturation only through the mobility.
 """
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from physics_prior import pressure_prior
 
 SWC, SOR = 0.2, 0.2
 # fixed input scalings (benchmark k in [0.02, 0.2]; game k = that x mult in [0.5, 2] -> [0.01, 0.4])
@@ -28,6 +39,7 @@ P_SCALE = 6.0            # the game's pressure cap; p is fed and predicted in un
 DP_SCALE = 3.0           # typical per-stage pressure change, in units of P_SCALE * 1
 DS_SCALE = 0.3
 IN_CH = 5
+RES_SCALE = 0.5          # typical size of the residual on top of the physics prior (hybrid modes)
 
 
 def encode(k, phi, well_rate, p_in, sw_in):
@@ -68,11 +80,12 @@ class _Decoder(nn.Module):
 class StageNet(nn.Module):
     """x:[B,5,H,W] -> (dp, dSw) each [B,H,W], in scaled units."""
 
-    def __init__(self, backbone="unet", width=48):
+    def __init__(self, backbone="unet", width=48, hybrid="none", n_sub=8, stage_time=1.0):
         super().__init__()
-        self.backbone = backbone
+        assert hybrid in ("none", "prior", "prior2")
+        self.backbone, self.hybrid, self.n_sub, self.stage_time = backbone, hybrid, n_sub, stage_time
         c = width
-        self.e0 = nn.Sequential(_block(IN_CH, c), _block(c, c))
+        self.e0 = nn.Sequential(_block(IN_CH + (hybrid != "none"), c), _block(c, c))
         self.e1 = nn.Sequential(_block(c, c * 2, stride=2), _block(c * 2, c * 2))
         self.e2 = nn.Sequential(_block(c * 2, c * 4, stride=2), _block(c * 4, c * 4))
         if backbone == "ccs":
@@ -92,12 +105,27 @@ class StageNet(nn.Module):
             dp, ds = o[:, 0], o[:, 1]
         return dp, ds
 
+    @classmethod
+    def from_blob(cls, blob):
+        return cls(blob.get("backbone", "unet"), blob.get("width", 48), blob.get("hybrid", "none"),
+                   blob.get("n_sub", 8), blob.get("stage_time", 1.0))
+
     def step(self, k, phi, well_rate, p_in, sw_in):
         """Physical-units one-step prediction: returns (p_out, sw_out) tensors [B,H,W]."""
-        dp, ds = self(encode(k, phi, well_rate, p_in, sw_in))
-        p_out = p_in + dp * DP_SCALE
+        if self.hybrid != "none" and k.shape[0] > 256:      # keep the dense [B,144,144] systems small
+            outs = [self.step(*(a[i:i + 256] for a in (k, phi, well_rate, p_in, sw_in))) for i in range(0, k.shape[0], 256)]
+            return torch.cat([o[0] for o in outs]), torch.cat([o[1] for o in outs])
+        x = encode(k, phi, well_rate, p_in, sw_in)
+        if self.hybrid == "none":
+            dp, ds = self(x)
+            return p_in + dp * DP_SCALE, (sw_in + ds * DS_SCALE).clamp(SWC, 1 - SOR)
+        with torch.no_grad():                 # the frozen-lambda prior is a function of the inputs only
+            p_a = pressure_prior(k, phi, sw_in, well_rate, p_in, self.stage_time, self.n_sub, dtype=torch.float32)
+        dp, ds = self(torch.cat([x, ((p_a - p_in) / DP_SCALE).unsqueeze(1)], 1))
         sw_out = (sw_in + ds * DS_SCALE).clamp(SWC, 1 - SOR)
-        return p_out, sw_out
+        base = p_a if self.hybrid == "prior" else pressure_prior(k, phi, sw_in, well_rate, p_in, self.stage_time,
+                                                                 self.n_sub, sw_end=sw_out, dtype=torch.float32)
+        return base + dp * RES_SCALE, sw_out
 
 
 class StageSurrogate:
@@ -106,7 +134,7 @@ class StageSurrogate:
     def __init__(self, ckpt=None, net=None, stage_time=1.0, device="cpu"):
         if net is None:
             blob = torch.load(ckpt, map_location=device)
-            net = StageNet(blob.get("backbone", "unet"), blob.get("width", 48))
+            net = StageNet.from_blob(blob)
             net.load_state_dict(blob["state_dict"])
             stage_time = blob.get("stage_time", stage_time)
         self.net = net.to(device).eval()

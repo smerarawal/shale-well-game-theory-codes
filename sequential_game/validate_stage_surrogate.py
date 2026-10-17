@@ -111,7 +111,7 @@ def main():
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     blob = torch.load(a.ckpt, map_location="cpu")
-    net = StageNet(blob["backbone"], blob["width"])
+    net = StageNet.from_blob(blob)
     net.load_state_dict(blob["state_dict"])
     net.eval()
 

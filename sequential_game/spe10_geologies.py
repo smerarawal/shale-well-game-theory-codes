@@ -117,10 +117,12 @@ def _coarsen(a, f):
     return a[:ny, :nx].reshape(ny // f, f, nx // f, f).mean(axis=(1, 3))
 
 
-def sample_patches(logk, phi, layers, n, n_cells=12, coarsen=1, seed=0, min_contrast=0.3):
+def sample_patches(logk, phi, layers, n, n_cells=12, coarsen=1, seed=0, min_contrast=0.3, band="all"):
     """n random n_cells x n_cells patches from random layers in `layers`.
     Patches whose log10 K range is below `min_contrast` decades are rejected (near-uniform
-    patches carry no structure and would dominate after per-patch min-max rescaling)."""
+    patches carry no structure and would dominate after per-patch min-max rescaling).
+    band: "all" | "train" | "test" -- split along the long (y) axis so patches of the two bands
+    never share a row: valid top-left rows are cut at the middle, with a gap of one patch height."""
     rng = np.random.default_rng(seed)
     layers = list(layers)
     out = []
@@ -129,7 +131,10 @@ def sample_patches(logk, phi, layers, n, n_cells=12, coarsen=1, seed=0, min_cont
         tries += 1
         z = int(rng.choice(layers))
         lk, ph = _coarsen(logk[z], coarsen), _coarsen(phi[z], coarsen)
-        i = int(rng.integers(0, lk.shape[0] - n_cells + 1))
+        hi_i = lk.shape[0] - n_cells                                  # last valid top-left row
+        lo_i, top_i = {"all": (0, hi_i), "train": (0, hi_i // 2 - n_cells // 2),
+                       "test": (hi_i // 2 + n_cells // 2 + 1, hi_i)}[band]
+        i = int(rng.integers(lo_i, top_i + 1))
         j = int(rng.integers(0, lk.shape[1] - n_cells + 1))
         pk, pp = lk[i:i + n_cells, j:j + n_cells], ph[i:i + n_cells, j:j + n_cells]
         if pk.max() - pk.min() < min_contrast:

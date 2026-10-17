@@ -9,6 +9,9 @@ true pressure is high (the game penalty is quadratic above 6) + a direct per-sam
 p_max term + a saturation term. Saturation is state, not scored, so it gets a lower weight.
 
     python train_stage_surrogate.py --data stage_train.npz --out stage_unet.pt --backbone unet --epochs 40
+    python train_stage_surrogate.py --data stage_train.npz stage_spe10_train.npz --hybrid prior2 --out h.pt
+
+Several --data files are concatenated before the episode split (e.g. random fields + channelised SPE10 patches).
 """
 import argparse
 import json
@@ -69,7 +72,9 @@ def evaluate(net, data, bs=512):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True)
+    ap.add_argument("--data", required=True, nargs="+")
+    ap.add_argument("--hybrid", default="none", choices=["none", "prior", "prior2"])
+    ap.add_argument("--n_sub", type=int, default=8)
     ap.add_argument("--out", required=True)
     ap.add_argument("--backbone", default="unet", choices=["unet", "ccs"])
     ap.add_argument("--width", type=int, default=48)
@@ -85,14 +90,15 @@ def main():
 
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)
-    d = load(a.data)
+    parts = [load(p) for p in a.data]
+    d = {k: np.concatenate([q[k] for q in parts]) for k in parts[0] if k != "policy"}
     tr, va, te = episode_split(d["permeability"].shape[0])
     D = {n: {k: v.to(a.device) for k, v in flatten(d, e).items()} for n, e in (("train", tr), ("val", va), ("test", te))}
     stage_time = float(d["elapsed"].mean())
     print(f"episodes train/val/test = {len(tr)}/{len(va)}/{len(te)}; rows = "
           f"{D['train']['k'].shape[0]}/{D['val']['k'].shape[0]}/{D['test']['k'].shape[0]}; stage_time {stage_time}")
 
-    net = StageNet(a.backbone, a.width).to(a.device)
+    net = StageNet(a.backbone, a.width, a.hybrid, a.n_sub, stage_time).to(a.device)
     print("params:", sum(p.numel() for p in net.parameters()))
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=1e-4)
     N = D["train"]["k"].shape[0]
@@ -120,7 +126,7 @@ def main():
         score = v["p_rmse"] + v["pmax_abs"]           # pressure-relevant selection, not saturation
         if score < best:
             best, best_ep = score, ep
-            torch.save({"state_dict": net.state_dict(), "backbone": a.backbone, "width": a.width,
+            torch.save({"state_dict": net.state_dict(), "backbone": a.backbone, "width": a.width, "hybrid": a.hybrid, "n_sub": a.n_sub,
                         "stage_time": stage_time, "args": vars(a)}, a.out)
         if ep % 5 == 0 or ep == 1:
             print(f"ep {ep:3d} train {run / N:.5f} | val p_rmse {v['p_rmse']:.4f} pmax_abs {v['pmax_abs']:.4f} "

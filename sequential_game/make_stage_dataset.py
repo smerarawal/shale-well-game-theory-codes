@@ -121,9 +121,10 @@ def build_jobs(a):
     if a.spe10_dir:  # OOD eval set: channelised / smooth real-rock patches, never used for training
         from spe10_geologies import load_spe10, sample_patches, TARBERT, UPPER_NESS
         logk, phi = load_spe10(a.spe10_dir)
-        layers = {"tarbert": TARBERT, "ness": UPPER_NESS}[a.spe10_region]
-        for e, pt in enumerate(sample_patches(logk, phi, layers, a.n_episodes, a.n, a.spe10_coarsen, a.seed)):
-            jobs.append((e, 2_000_000 + e, draw_mult(rng), a.n, int(rng.integers(1 << 31)), a.stage_time, 0.0, pt))
+        layers = {"tarbert": TARBERT, "ness": UPPER_NESS, "both": list(TARBERT) + list(UPPER_NESS)}[a.spe10_region]
+        base = {"all": 2_000_000, "test": 2_000_000, "train": 3_000_000}[a.spe10_band]
+        for e, pt in enumerate(sample_patches(logk, phi, layers, a.n_episodes, a.n, a.spe10_coarsen, a.seed, band=a.spe10_band)):
+            jobs.append((e, base + e, draw_mult(rng), a.n, int(rng.integers(1 << 31)), a.stage_time, a.random_site_frac if a.spe10_band == "train" else 0.0, pt))
     elif a.eval_geos:  # the game's own 24 truths (+ the two particle fields at a few multipliers)
         for i in range(a.n_eval_geos):
             for rep in range(a.reps):
@@ -148,7 +149,9 @@ def main():
     ap.add_argument("--eval_geos", action="store_true", help="episodes on the game's true_geo(0..23)")
     ap.add_argument("--n_eval_geos", type=int, default=24)
     ap.add_argument("--spe10_dir", default=None, help="folder with spe_perm.dat/spe_phi.dat -> OOD eval set from SPE10 patches")
-    ap.add_argument("--spe10_region", choices=["tarbert", "ness"], default="ness")
+    ap.add_argument("--spe10_region", choices=["tarbert", "ness", "both"], default="ness")
+    ap.add_argument("--spe10_band", choices=["all", "train", "test"], default="all",
+                    help="train/test: disjoint halves of the long axis (training-time channelised data vs held-out patches)")
     ap.add_argument("--spe10_coarsen", type=int, default=1)
     ap.add_argument("--reps", type=int, default=3, help="policy replicates per game geology (eval_geos)")
     a = ap.parse_args()
