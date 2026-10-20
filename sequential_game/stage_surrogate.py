@@ -13,7 +13,9 @@ Design (see SURROGATE_HANDOFF.md sections 6-8):
     Sw_out = clip(Sw_in + dSw, Swc, 1 - Sor), the solver's own saturation bounds;
   * units stay solver units; elapsed time returned is exactly stage_time.
 
-The backbone is a small U-Net ("unet") or a CCSNet-style two-decoder U-Net ("ccs").
+The backbone is a small U-Net ("unet"), a CCSNet-style two-decoder U-Net ("ccs"), a grid-graph message-passing
+network with permeability edge features and separate pressure/saturation heads ("gnn"), an HGNS-style split
+(U-Net for pressure, GNN for saturation: "split"), a U-Net with a ConvLSTM bottleneck ("runet") or a small FNO ("fno").
 
 Hybrid modes (physics_prior.py = the solver's own implicit pressure step, batched in torch):
   hybrid="none"    pure learned model (above).
@@ -77,24 +79,200 @@ class _Decoder(nn.Module):
         return self.out(self.m2(torch.cat([h, f0], 1)))
 
 
+BACKBONES = ("unet", "ccs", "gnn", "split", "runet", "fno")
+
+_DIRS = ((0, 1), (0, -1), (1, 0), (-1, 0))        # neighbour offsets (dy, dx) of the 4-neighbour grid graph
+
+
+def _shift(t, dy, dx):
+    """out[..., i, j] = t[..., i+dy, j+dx], zero outside the grid."""
+    H, W = t.shape[-2:]
+    tp = F.pad(t, (1, 1, 1, 1))
+    return tp[..., 1 + dy:1 + dy + H, 1 + dx:1 + dx + W]
+
+
+class _UNet(nn.Module):
+    """Single-decoder U-Net, n_out channels (same blocks as the 'unet' backbone)."""
+
+    def __init__(self, in_ch, c, n_out):
+        super().__init__()
+        self.e0 = nn.Sequential(_block(in_ch, c), _block(c, c))
+        self.e1 = nn.Sequential(_block(c, c * 2, stride=2), _block(c * 2, c * 2))
+        self.e2 = nn.Sequential(_block(c * 2, c * 4, stride=2), _block(c * 4, c * 4))
+        self.dec = _Decoder(c, n_out)
+
+    def forward(self, x):
+        f0 = self.e0(x)
+        f1 = self.e1(f0)
+        return self.dec(f0, f1, self.e2(f1))
+
+
+class _GridGNN(nn.Module):
+    """Message passing on the 4-neighbour grid graph (nodes = cells, MeshGraphNet-style).
+    Edge features come from the permeability field -- harmonic-mean k across the face and the log-k jump,
+    i.e. what the physics' transmissibility depends on; one message MLP per direction (gravity acts along j);
+    domain boundaries have no edges. A global-mean context is added in every layer so the receptive field is
+    the whole grid (pressure responds globally). One head per output = separate pressure / saturation
+    decoders (the CCS idea). Returns a tuple of [B,H,W] tensors."""
+
+    def __init__(self, in_ch, c, n_layers=6, n_out=2):
+        super().__init__()
+        self.n_layers = n_layers
+        self.enc = nn.Sequential(nn.Conv2d(in_ch, c, 1), nn.GELU(), nn.Conv2d(c, c, 1))
+        self.msg = nn.ModuleList([nn.ModuleList([nn.Sequential(nn.Conv2d(2 * c + 2, c, 1), nn.GELU(), nn.Conv2d(c, c, 1))
+                                                 for _ in _DIRS]) for _ in range(n_layers)])
+        self.upd = nn.ModuleList([nn.Sequential(nn.Conv2d(2 * c, c, 1), nn.GELU(), nn.Conv2d(c, c, 1)) for _ in range(n_layers)])
+        self.glob = nn.ModuleList([nn.Conv2d(c, c, 1) for _ in range(n_layers)])
+        self.norm = nn.ModuleList([nn.GroupNorm(min(8, c), c) for _ in range(n_layers)])
+        self.heads = nn.ModuleList([nn.Sequential(nn.Conv2d(c, c, 1), nn.GELU(), nn.Conv2d(c, 1, 1)) for _ in range(n_out)])
+
+    @staticmethod
+    def edge_features(x):
+        lk = x[:, 0:1]                                           # normalised log k
+        k = torch.exp(lk * LOGK_STD + LOGK_MEAN)
+        ones = torch.ones(1, 1, *x.shape[-2:], device=x.device, dtype=x.dtype)
+        out = []
+        for dy, dx in _DIRS:
+            m = _shift(ones, dy, dx)                             # 0 where the neighbour is outside the grid
+            kn = _shift(k, dy, dx)
+            kh = 2 * k * kn / (k + kn + 1e-9)
+            f1 = (torch.log(kh + 1e-9) - LOGK_MEAN) / LOGK_STD
+            f2 = _shift(lk, dy, dx) - lk
+            out.append((torch.cat([f1, f2], 1) * m, m))
+        return out
+
+    def forward(self, x):
+        edges = self.edge_features(x)
+        h = self.enc(x)
+        for l in range(self.n_layers):
+            agg = 0
+            for d, (dy, dx) in enumerate(_DIRS):
+                e, m = edges[d]
+                agg = agg + self.msg[l][d](torch.cat([h, _shift(h, dy, dx), e], 1)) * m
+            h = self.norm[l](h + self.upd[l](torch.cat([h, agg], 1)) + self.glob[l](h.mean((2, 3), keepdim=True)))
+        return tuple(hd(h)[:, 0] for hd in self.heads)
+
+
+class _Split(nn.Module):
+    """HGNS-style division of labour (Wu et al., hybrid graph network simulator): a U-Net for the global
+    pressure change, a graph network for the local saturation change."""
+
+    def __init__(self, in_ch, c):
+        super().__init__()
+        self.pnet = _UNet(in_ch, c, 1)
+        self.snet = _GridGNN(in_ch, c, n_out=1)
+
+    def forward(self, x):
+        return self.pnet(x)[:, 0], self.snet(x)[0]
+
+
+class _ConvLSTMCell(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.conv = nn.Conv2d(2 * ch, 4 * ch, 3, padding=1)
+
+    def forward(self, x, h, c):
+        i, f, g, o = self.conv(torch.cat([x, h], 1)).chunk(4, 1)
+        c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+        return torch.sigmoid(o) * torch.tanh(c), c
+
+
+class _RUNet(nn.Module):
+    """R-U-Net flavour: U-Net whose bottleneck is refined by a ConvLSTM unrolled n_rec times within the stage
+    (the hidden state is reset every stage: the game state (p, Sw) is already Markov)."""
+
+    def __init__(self, in_ch, c, n_rec=4):
+        super().__init__()
+        self.n_rec = n_rec
+        self.e0 = nn.Sequential(_block(in_ch, c), _block(c, c))
+        self.e1 = nn.Sequential(_block(c, c * 2, stride=2), _block(c * 2, c * 2))
+        self.e2 = nn.Sequential(_block(c * 2, c * 4, stride=2), _block(c * 4, c * 4))
+        self.proj, self.cell, self.back = nn.Conv2d(c * 4, c * 2, 1), _ConvLSTMCell(c * 2), nn.Conv2d(c * 2, c * 4, 1)
+        self.dec = _Decoder(c, 2)
+
+    def forward(self, x):
+        f0 = self.e0(x)
+        f1 = self.e1(f0)
+        f2 = self.e2(f1)
+        z = self.proj(f2)
+        h, cs = torch.zeros_like(z), torch.zeros_like(z)
+        for _ in range(self.n_rec):
+            h, cs = self.cell(z, h, cs)
+        o = self.dec(f0, f1, f2 + self.back(h))
+        return o[:, 0], o[:, 1]
+
+
+class _SpectralConv2d(nn.Module):
+    def __init__(self, ci, co, modes):
+        super().__init__()
+        s = 1.0 / (ci * co)
+        self.m = modes
+        self.w1 = nn.Parameter(s * torch.randn(ci, co, modes, modes, 2))     # real storage of complex weights
+        self.w2 = nn.Parameter(s * torch.randn(ci, co, modes, modes, 2))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        xf = torch.fft.rfft2(x)
+        m1, m2 = min(self.m, H // 2), min(self.m, W // 2 + 1)
+        out = torch.zeros(B, self.w1.shape[1], H, W // 2 + 1, dtype=xf.dtype, device=x.device)
+        w1, w2 = torch.view_as_complex(self.w1), torch.view_as_complex(self.w2)
+        out[:, :, :m1, :m2] = torch.einsum("bixy,ioxy->boxy", xf[:, :, :m1, :m2], w1[:, :, :m1, :m2])
+        out[:, :, H - m1:, :m2] = torch.einsum("bixy,ioxy->boxy", xf[:, :, H - m1:, :m2], w2[:, :, :m1, :m2])
+        return torch.fft.irfft2(out, s=(H, W))
+
+
+class _FNO(nn.Module):
+    """Small Fourier neural operator (the family of U-FNO / CCSNet's spectral parts), two output heads."""
+
+    def __init__(self, in_ch, c, modes=6, n_layers=4):
+        super().__init__()
+        self.lift = nn.Conv2d(in_ch + 2, c, 1)
+        self.spec = nn.ModuleList([_SpectralConv2d(c, c, modes) for _ in range(n_layers)])
+        self.pw = nn.ModuleList([nn.Conv2d(c, c, 1) for _ in range(n_layers)])
+        self.heads = nn.ModuleList([nn.Sequential(nn.Conv2d(c, c, 1), nn.GELU(), nn.Conv2d(c, 1, 1)) for _ in range(2)])
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+        gy = torch.linspace(0, 1, H, device=x.device, dtype=x.dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+        gx = torch.linspace(0, 1, W, device=x.device, dtype=x.dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        h = self.lift(torch.cat([x, gy, gx], 1))
+        for l, (s, p) in enumerate(zip(self.spec, self.pw)):
+            h = s(h) + p(h)
+            if l < len(self.spec) - 1:
+                h = F.gelu(h)
+        return tuple(hd(h)[:, 0] for hd in self.heads)
+
+
+def _make_core(backbone, in_ch, c):
+    return {"gnn": lambda: _GridGNN(in_ch, c, n_out=2), "split": lambda: _Split(in_ch, c),
+            "runet": lambda: _RUNet(in_ch, c), "fno": lambda: _FNO(in_ch, c)}[backbone]()
+
+
 class StageNet(nn.Module):
     """x:[B,5,H,W] -> (dp, dSw) each [B,H,W], in scaled units."""
 
     def __init__(self, backbone="unet", width=48, hybrid="none", n_sub=8, stage_time=1.0):
         super().__init__()
         assert hybrid in ("none", "prior", "prior2")
+        assert backbone in BACKBONES, f"backbone must be one of {BACKBONES}"
         self.backbone, self.hybrid, self.n_sub, self.stage_time = backbone, hybrid, n_sub, stage_time
         c = width
-        self.e0 = nn.Sequential(_block(IN_CH + (hybrid != "none"), c), _block(c, c))
-        self.e1 = nn.Sequential(_block(c, c * 2, stride=2), _block(c * 2, c * 2))
-        self.e2 = nn.Sequential(_block(c * 2, c * 4, stride=2), _block(c * 4, c * 4))
-        if backbone == "ccs":
-            self.dp = _Decoder(c, 1)
-            self.ds = _Decoder(c, 1)
+        in_ch = IN_CH + (hybrid != "none")
+        if backbone in ("unet", "ccs"):
+            self.e0 = nn.Sequential(_block(in_ch, c), _block(c, c))
+            self.e1 = nn.Sequential(_block(c, c * 2, stride=2), _block(c * 2, c * 2))
+            self.e2 = nn.Sequential(_block(c * 2, c * 4, stride=2), _block(c * 4, c * 4))
+            if backbone == "ccs":
+                self.dp = _Decoder(c, 1)
+                self.ds = _Decoder(c, 1)
+            else:
+                self.dec = _Decoder(c, 2)
         else:
-            self.dec = _Decoder(c, 2)
+            self.core = _make_core(backbone, in_ch, c)
 
     def forward(self, x):
+        if hasattr(self, "core"):
+            return self.core(x)
         f0 = self.e0(x)
         f1 = self.e1(f0)
         f2 = self.e2(f1)

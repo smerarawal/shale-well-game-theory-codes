@@ -37,7 +37,7 @@ for s in $SEEDS; do
     if [ $data = game ]; then DATA="$OUT/stage_train.npz"; else DATA="$OUT/stage_train.npz $OUT/spe10_train.npz"; fi
     for h in none prior prior2; do
       tag=${h}_${data}_s$s
-      [ -f $OUT/$tag.pt ] || python train_stage_surrogate.py --data $DATA --hybrid $h --seed $s --epochs $EPOCHS --out $OUT/$tag.pt 2>&1 | tee $OUT/train_$tag.log | grep -E "^(ep +(1|[0-9]*0) |best|params| test)" || true
+      [ -f $OUT/${tag}_metrics.json ] || python train_stage_surrogate.py --data $DATA --hybrid $h --seed $s --epochs $EPOCHS --out $OUT/$tag.pt 2>&1 | tee $OUT/train_$tag.log | grep -E "^(ep +(1|[0-9]*0) |best|params| test)" || true
       for ev in game tarbert ness; do
         python validate_stage_surrogate.py --ckpt $OUT/$tag.pt --eval_data ${EVAL[$ev]} --eval_name $ev --out $OUT/val_${tag}_$ev > /dev/null
       done
