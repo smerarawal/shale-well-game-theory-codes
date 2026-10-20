@@ -70,9 +70,44 @@ def stage_metrics(pp, ps, d, eps):
             "frac_pen_err_le_tol": None}
 
 
+def sat_metrics(ps, d, eps, thrs=(0.3, 0.5)):
+    """Saturation quantities a plume penalty / plume-overlap / saturation-monitoring term would read, per stage [T].
+    plume = cells with Sw > thr (Swc = 0.2, so 0.3 is 'fluid has arrived', 0.5 is 'well swept');
+    edge = outer ring of cells (stand-in for a boundary / off-limits zone).
+    Rates over episodes are unconditional (sw_edge_reach_true_* is the base rate, to condition on)."""
+    st, wr = d["Sw_out"][eps], d["well_rate"][eps]
+    E, T, n, _ = st.shape
+    edge = np.zeros((n, n), bool)
+    edge[0, :] = edge[-1, :] = edge[:, 0] = edge[:, -1] = True
+    out = {}
+    for th in thrs:
+        k = int(round(th * 100))
+        a_t, a_p = st > th, ps > th
+        inter, union = (a_t & a_p).sum((-2, -1)), (a_t | a_p).sum((-2, -1))
+        out[f"sw_iou_{k}"] = np.where(union > 0, inter / np.maximum(union, 1), 1.0).mean(0)
+        da = (a_p.sum((-2, -1)) - a_t.sum((-2, -1))) / (n * n)         # plume area error, fraction of the grid
+        out[f"sw_area_bias_{k}"], out[f"sw_area_abs_{k}"] = da.mean(0), np.abs(da).mean(0)
+        bt, bp = (a_t & edge).any((-2, -1)), (a_p & edge).any((-2, -1))
+        out[f"sw_edge_reach_true_{k}"] = bt.mean(0)
+        out[f"sw_edge_miss_{k}"] = (bt & ~bp).mean(0)                  # truth reaches the edge, prediction does not
+        out[f"sw_edge_false_{k}"] = (~bt & bp).mean(0)                 # prediction reaches the edge, truth does not
+    em = lambda a: np.where(edge, a, -1.0).max((-2, -1))
+    out["sw_edge_max_err"] = np.abs(em(ps) - em(st)).mean(0)
+    band = (st > 0.3) & (st < 0.7)                                      # the moving front
+    fr, wl = np.full(T, np.nan), np.full(T, np.nan)
+    for s in range(T):
+        if band[:, s].any():
+            fr[s] = np.sqrt(((ps[:, s] - st[:, s])[band[:, s]] ** 2).mean())
+        if (wr[:, s] > 0).any():
+            wl[s] = np.sqrt(((ps[:, s] - st[:, s])[wr[:, s] > 0] ** 2).mean())
+    out["sw_front_rmse"], out["sw_well_rmse"] = fr, wl
+    return out
+
+
 def run(net, d, eps, name, tol, lines, out):
     pp, ps = rollout(net, d, eps)
     m = stage_metrics(pp, ps, d, eps)
+    m.update(sat_metrics(ps, d, eps))
     dpen = np.abs(pen(pp.reshape(len(eps), pp.shape[1], -1).max(-1)) - pen(d["p_out"][eps].reshape(len(eps), pp.shape[1], -1).max(-1)))
     m["frac_pen_err_le_tol"] = (dpen <= tol).mean(0)
     op, _ = one_step(net, d, eps)
@@ -87,6 +122,13 @@ def run(net, d, eps, name, tol, lines, out):
                      ("well_rmse", "well-cell RMSE"), ("field_rmse", "field p RMSE"), ("sw_rmse", "Sw RMSE")):
         lines.append(f"| {lab} | {fmt(m[key])} |")
     lines.append(f"| p_max |err| (one-step, teacher-forced) | {fmt(ms['pmax_abs'])} |")
+    lines += ["\nSaturation (rollout; plume = Sw above threshold, edge = outer ring of cells):\n", "| metric | k=1 | k=2 | k=3 | k=4 | k=5 | k=6 |", "|---|---|---|---|---|---|---|"]
+    for key, lab in (("sw_rmse", "Sw RMSE (field)"), ("sw_iou_50", "plume IoU, Sw>0.5"), ("sw_iou_30", "plume IoU, Sw>0.3"),
+                     ("sw_area_bias_30", "plume area bias, Sw>0.3 (frac of grid)"), ("sw_area_abs_30", "plume area |err|, Sw>0.3"),
+                     ("sw_edge_reach_true_30", "truth plume reaches edge, Sw>0.3 (rate)"), ("sw_edge_miss_30", "edge reach missed by prediction"),
+                     ("sw_edge_false_30", "edge reach false alarm"), ("sw_edge_max_err", "edge max-Sw |err|"),
+                     ("sw_front_rmse", "front-band RMSE (0.3<Sw<0.7)"), ("sw_well_rmse", "well-cell Sw RMSE")):
+        lines.append(f"| {lab} | {fmt(m[key])} |")
     # strata
     mult, nw = d["mult"][eps], d["n_wells"][eps]
     lines += ["\nStrata (p_max |err| / penalty |err| at k=6 and mean over k=1..6):\n", "| stratum | n | pmax err k=6 | pen err k=6 | pmax err mean k | pen err mean k |", "|---|---|---|---|---|---|"]

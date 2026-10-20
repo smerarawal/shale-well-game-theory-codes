@@ -35,7 +35,9 @@ for f in sorted(glob.glob(os.path.join(a.dir, "val_*_mix_s*_*.json"))):
 
 def ms(vals):
     v = np.array(vals, float)
-    return f"{v.mean():.3g}" + (f" ±{v.std():.2g}" if len(v) > 1 else "")
+    if v.size == 0 or np.isnan(v).all():
+        return "-"
+    return f"{np.nanmean(v):.3g}" + (f" ±{np.nanstd(v):.2g}" if v.size > 1 else "")
 
 
 lines = ["# Backbone sweep inside the physics hybrid (train data: game + SPE10 train band)\n",
@@ -57,6 +59,34 @@ for ev in ("game", "tarbert", "ness"):
         rows.append((key, f"| {h} | {bb} | {len(runs)} | {params} | {secs} | {g('pmax_abs', 2)} | {g('pmax_abs', 5)} | {g('pmax_bias', 5)} | "
                           f"{g('penalty_abs', 5)} | {g('frac_pen_err_le_tol', 5)} | {g('well_rmse', 5)} |"))
     lines += [r for _, r in sorted(rows)]
+    # saturation: what a plume penalty / plume-overlap / saturation-monitoring term would read (k=6 rollout)
+    lines += [f"\n### saturation, eval set: {ev}  (plume = Sw>0.3 unless noted; edge = outer ring of cells; k=6)\n",
+              "| hybrid | backbone | Sw RMSE | plume IoU Sw>0.5 | plume IoU Sw>0.3 | area bias (frac grid) | truth reaches edge (rate) | edge missed | edge false alarm | edge max-Sw err | front-band RMSE | well-cell Sw RMSE |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    srows = []
+    for (h, bb), d in R.items():
+        runs = d.get(ev)
+        if not runs:
+            continue
+        gs = lambda key: ms([r[key][5] for r in runs if key in r])
+        srows.append((float(np.nanmean([r["sw_iou_50"][5] for r in runs if "sw_iou_50" in r] or [np.nan])) * -1,
+                      f"| {h} | {bb} | {gs('sw_rmse')} | {gs('sw_iou_50')} | {gs('sw_iou_30')} | {gs('sw_area_bias_30')} | "
+                      f"{gs('sw_edge_reach_true_30')} | {gs('sw_edge_miss_30')} | {gs('sw_edge_false_30')} | {gs('sw_edge_max_err')} | "
+                      f"{gs('sw_front_rmse')} | {gs('sw_well_rmse')} |"))
+    lines += [r for _, r in sorted(srows, key=lambda t: (np.isnan(t[0]), t[0]))]
+
+# one-glance summary (inserted at the top): backbone x hybrid, "penalty err / p_max err" at stage 6
+pivot = ["\n## Summary: penalty err (welfare units) / p_max err at stage 6, backbone x hybrid\n",
+         "none = pure learned, prior = physics prior as input channel, prior2 = prior + pressure re-solved with the predicted saturation.\n"]
+for ev in ("game", "tarbert", "ness"):
+    pivot += [f"\n### {ev}\n", "| backbone | none | prior | prior2 |", "|---|---|---|---|"]
+    for bb in sorted({b for (_, b) in R}):
+        cells = []
+        for h in ("none", "prior", "prior2"):
+            runs = R.get((h, bb), {}).get(ev)
+            cells.append(f"{ms([r['penalty_abs'][5] for r in runs])} / {ms([r['pmax_abs'][5] for r in runs])}" if runs else "-")
+        pivot.append(f"| {bb} | " + " | ".join(cells) + " |")
+lines[2:2] = pivot
 txt = "\n".join(lines)
 print(txt)
 open(a.out or os.path.join(a.dir, "arch_sweep.md"), "w").write(txt + "\n")

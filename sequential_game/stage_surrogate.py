@@ -79,7 +79,7 @@ class _Decoder(nn.Module):
         return self.out(self.m2(torch.cat([h, f0], 1)))
 
 
-BACKBONES = ("unet", "ccs", "gnn", "split", "runet", "fno")
+BACKBONES = ("unet", "ccs", "gnn", "split", "runet", "fno", "ufno")
 
 _DIRS = ((0, 1), (0, -1), (1, 0), (-1, 0))        # neighbour offsets (dy, dx) of the 4-neighbour grid graph
 
@@ -221,14 +221,33 @@ class _SpectralConv2d(nn.Module):
         return torch.fft.irfft2(out, s=(H, W))
 
 
-class _FNO(nn.Module):
-    """Small Fourier neural operator (the family of U-FNO / CCSNet's spectral parts), two output heads."""
+class _UNetPath(nn.Module):
+    """Small conv encoder-decoder used as the U-Net path of a U-FNO layer (one down/up level)."""
 
-    def __init__(self, in_ch, c, modes=6, n_layers=4):
+    def __init__(self, c):
+        super().__init__()
+        self.down = nn.Sequential(nn.Conv2d(c, c, 3, stride=2, padding=1), nn.GELU(), nn.Conv2d(c, c, 3, padding=1), nn.GELU())
+        self.up = nn.ConvTranspose2d(c, c, 4, stride=2, padding=1)
+        self.out = nn.Conv2d(2 * c, c, 3, padding=1)
+
+    def forward(self, x):
+        h = self.up(self.down(x))
+        if h.shape[-2:] != x.shape[-2:]:
+            h = F.interpolate(h, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return self.out(torch.cat([h, x], 1))
+
+
+class _FNO(nn.Module):
+    """Small Fourier neural operator, two output heads. u_layers > 0 makes the LAST u_layers layers U-FNO layers
+    (Fourier path + pointwise path + a U-Net path, as in U-FNO / CCSNet's building block)."""
+
+    def __init__(self, in_ch, c, modes=6, n_layers=4, u_layers=0):
         super().__init__()
         self.lift = nn.Conv2d(in_ch + 2, c, 1)
+        self.n_layers, self.u_layers = n_layers, u_layers
         self.spec = nn.ModuleList([_SpectralConv2d(c, c, modes) for _ in range(n_layers)])
         self.pw = nn.ModuleList([nn.Conv2d(c, c, 1) for _ in range(n_layers)])
+        self.unet = nn.ModuleList([_UNetPath(c) for _ in range(u_layers)])
         self.heads = nn.ModuleList([nn.Sequential(nn.Conv2d(c, c, 1), nn.GELU(), nn.Conv2d(c, 1, 1)) for _ in range(2)])
 
     def forward(self, x):
@@ -237,15 +256,17 @@ class _FNO(nn.Module):
         gx = torch.linspace(0, 1, W, device=x.device, dtype=x.dtype).view(1, 1, 1, W).expand(B, 1, H, W)
         h = self.lift(torch.cat([x, gy, gx], 1))
         for l, (s, p) in enumerate(zip(self.spec, self.pw)):
-            h = s(h) + p(h)
-            if l < len(self.spec) - 1:
-                h = F.gelu(h)
+            z = s(h) + p(h)
+            if l >= self.n_layers - self.u_layers:
+                z = z + self.unet[l - (self.n_layers - self.u_layers)](h)
+            h = F.gelu(z) if l < self.n_layers - 1 else z
         return tuple(hd(h)[:, 0] for hd in self.heads)
 
 
 def _make_core(backbone, in_ch, c):
     return {"gnn": lambda: _GridGNN(in_ch, c, n_out=2), "split": lambda: _Split(in_ch, c),
-            "runet": lambda: _RUNet(in_ch, c), "fno": lambda: _FNO(in_ch, c)}[backbone]()
+            "runet": lambda: _RUNet(in_ch, c), "fno": lambda: _FNO(in_ch, c),
+            "ufno": lambda: _FNO(in_ch, c, u_layers=2)}[backbone]()
 
 
 class StageNet(nn.Module):
