@@ -34,9 +34,10 @@ def rollout(net, d, eps):
     k, phi, wr = t(d["permeability"][eps]), t(d["porosity"][eps]), t(d["well_rate"][eps])
     E, T, n, _ = wr.shape
     p, sw = torch.zeros(E, n, n), torch.full((E, n, n), 0.2)
+    memory = None
     P, S = [], []
     for s in range(T):
-        p, sw = net.step(k, phi, wr[:, s], p, sw)
+        p, sw, memory = net.step(k, phi, wr[:, s], p, sw, memory=memory, return_memory=True)
         P.append(p.numpy()); S.append(sw.numpy())
     return np.stack(P, 1), np.stack(S, 1)
 
@@ -60,19 +61,69 @@ def stage_metrics(pp, ps, d, eps):
     dpm = pm_p - pm_t
     dpen = pen(pm_p) - pen(pm_t)
     wmask = wr > 0
+    pflat, ptflat = pp.reshape(E, T, -1), pt.reshape(E, T, -1)
+    sflat, stflat = ps.reshape(E, T, -1), st.reshape(E, T, -1)
+    p_center = ptflat.mean((0, 2), keepdims=True)
+    s_center = stflat.mean((0, 2), keepdims=True)
+    p_sst = ((ptflat - p_center) ** 2).sum((0, 2))
+    s_sst = ((stflat - s_center) ** 2).sum((0, 2))
+    p_r2 = 1.0 - ((pflat - ptflat) ** 2).sum((0, 2)) / np.maximum(p_sst, 1e-12)
+    s_r2 = 1.0 - ((sflat - stflat) ** 2).sum((0, 2)) / np.maximum(s_sst, 1e-12)
     well_rmse = np.array([np.sqrt(((pp[:, s] - pt[:, s])[wmask[:, s]] ** 2).mean()) for s in range(T)])
+    well_mae = np.array([np.abs((pp[:, s] - pt[:, s])[wmask[:, s]]).mean() for s in range(T)])
     return {"pmax_true_mean": pm_t.mean(0), "pmax_bias": dpm.mean(0), "pmax_abs": np.abs(dpm).mean(0),
             "pmax_abs_p95": np.percentile(np.abs(dpm), 95, axis=0),
             "penalty_abs": np.abs(dpen).mean(0), "penalty_bias": dpen.mean(0), "penalty_true_mean": pen(pm_t).mean(0),
-            "well_rmse": well_rmse,
+            "well_rmse": well_rmse, "well_mae": well_mae,
             "field_rmse": np.sqrt(((pp - pt) ** 2).reshape(E, T, -1).mean(-1)).mean(0),
+            "field_mae": np.abs(pp - pt).reshape(E, T, -1).mean(-1).mean(0), "field_r2": p_r2,
             "sw_rmse": np.sqrt(((ps - st) ** 2).reshape(E, T, -1).mean(-1)).mean(0),
+            "sw_mae": np.abs(ps - st).reshape(E, T, -1).mean(-1).mean(0), "sw_r2": s_r2,
             "frac_pen_err_le_tol": None}
+
+
+def sat_metrics(ps, d, eps, thrs=(0.3, 0.5)):
+    """Saturation quantities a plume penalty / plume-overlap / saturation-monitoring term would read, per stage [T].
+    plume = cells with Sw > thr (Swc = 0.2, so 0.3 is 'fluid has arrived', 0.5 is 'well swept');
+    edge = outer ring of cells (stand-in for a boundary / off-limits zone).
+    Rates over episodes are unconditional (sw_edge_reach_true_* is the base rate, to condition on)."""
+    st, wr = d["Sw_out"][eps], d["well_rate"][eps]
+    E, T, n, _ = st.shape
+    edge = np.zeros((n, n), bool)
+    edge[0, :] = edge[-1, :] = edge[:, 0] = edge[:, -1] = True
+    out = {}
+    for th in thrs:
+        k = int(round(th * 100))
+        a_t, a_p = st > th, ps > th
+        inter, union = (a_t & a_p).sum((-2, -1)), (a_t | a_p).sum((-2, -1))
+        out[f"sw_iou_{k}"] = np.where(union > 0, inter / np.maximum(union, 1), 1.0).mean(0)
+        da = (a_p.sum((-2, -1)) - a_t.sum((-2, -1))) / (n * n)         # plume area error, fraction of the grid
+        out[f"sw_area_bias_{k}"], out[f"sw_area_abs_{k}"] = da.mean(0), np.abs(da).mean(0)
+        bt, bp = (a_t & edge).any((-2, -1)), (a_p & edge).any((-2, -1))
+        out[f"sw_edge_reach_true_{k}"] = bt.mean(0)
+        out[f"sw_edge_miss_{k}"] = (bt & ~bp).mean(0)                  # truth reaches the edge, prediction does not
+        out[f"sw_edge_false_{k}"] = (~bt & bp).mean(0)                 # prediction reaches the edge, truth does not
+    phi = d["porosity"][eps][:, None]
+    inv_t = (phi * st).sum((-2, -1)) / phi.sum((-2, -1))
+    inv_p = (phi * ps).sum((-2, -1)) / phi.sum((-2, -1))
+    out["sw_inventory_bias"], out["sw_inventory_abs"] = (inv_p - inv_t).mean(0), np.abs(inv_p - inv_t).mean(0)
+    em = lambda a: np.where(edge, a, -1.0).max((-2, -1))
+    out["sw_edge_max_err"] = np.abs(em(ps) - em(st)).mean(0)
+    band = (st > 0.3) & (st < 0.7)                                      # the moving front
+    fr, wl = np.full(T, np.nan), np.full(T, np.nan)
+    for s in range(T):
+        if band[:, s].any():
+            fr[s] = np.sqrt(((ps[:, s] - st[:, s])[band[:, s]] ** 2).mean())
+        if (wr[:, s] > 0).any():
+            wl[s] = np.sqrt(((ps[:, s] - st[:, s])[wr[:, s] > 0] ** 2).mean())
+    out["sw_front_rmse"], out["sw_well_rmse"] = fr, wl
+    return out
 
 
 def run(net, d, eps, name, tol, lines, out):
     pp, ps = rollout(net, d, eps)
     m = stage_metrics(pp, ps, d, eps)
+    m.update(sat_metrics(ps, d, eps))
     dpen = np.abs(pen(pp.reshape(len(eps), pp.shape[1], -1).max(-1)) - pen(d["p_out"][eps].reshape(len(eps), pp.shape[1], -1).max(-1)))
     m["frac_pen_err_le_tol"] = (dpen <= tol).mean(0)
     op, _ = one_step(net, d, eps)
@@ -84,9 +135,19 @@ def run(net, d, eps, name, tol, lines, out):
     for key, lab in (("pmax_true_mean", "true p_max (mean)"), ("pmax_bias", "p_max bias (rollout)"),
                      ("pmax_abs", "p_max |err| (rollout)"), ("pmax_abs_p95", "p_max |err| p95"),
                      ("penalty_abs", f"penalty |err| (welfare units)"), ("frac_pen_err_le_tol", f"frac penalty err <= {tol}"),
-                     ("well_rmse", "well-cell RMSE"), ("field_rmse", "field p RMSE"), ("sw_rmse", "Sw RMSE")):
+                     ("well_rmse", "well-cell RMSE"), ("well_mae", "well-cell MAE"),
+                     ("field_rmse", "field p RMSE"), ("field_mae", "field p MAE"), ("field_r2", "field p R²"),
+                     ("sw_rmse", "Sw RMSE"), ("sw_mae", "Sw MAE"), ("sw_r2", "Sw R²")):
         lines.append(f"| {lab} | {fmt(m[key])} |")
     lines.append(f"| p_max |err| (one-step, teacher-forced) | {fmt(ms['pmax_abs'])} |")
+    lines += ["\nSaturation (rollout; plume = Sw above threshold, edge = outer ring of cells):\n", "| metric | k=1 | k=2 | k=3 | k=4 | k=5 | k=6 |", "|---|---|---|---|---|---|---|"]
+    for key, lab in (("sw_rmse", "Sw RMSE (field)"), ("sw_iou_50", "plume IoU, Sw>0.5"), ("sw_iou_30", "plume IoU, Sw>0.3"),
+                     ("sw_area_bias_30", "plume area bias, Sw>0.3 (frac of grid)"), ("sw_area_abs_30", "plume area |err|, Sw>0.3"),
+                     ("sw_inventory_bias", "porosity-weighted Sw inventory bias"), ("sw_inventory_abs", "porosity-weighted Sw inventory |err|"),
+                     ("sw_edge_reach_true_30", "truth plume reaches edge, Sw>0.3 (rate)"), ("sw_edge_miss_30", "edge reach missed by prediction"),
+                     ("sw_edge_false_30", "edge reach false alarm"), ("sw_edge_max_err", "edge max-Sw |err|"),
+                     ("sw_front_rmse", "front-band RMSE (0.3<Sw<0.7)"), ("sw_well_rmse", "well-cell Sw RMSE")):
+        lines.append(f"| {lab} | {fmt(m[key])} |")
     # strata
     mult, nw = d["mult"][eps], d["n_wells"][eps]
     lines += ["\nStrata (p_max |err| / penalty |err| at k=6 and mean over k=1..6):\n", "| stratum | n | pmax err k=6 | pen err k=6 | pmax err mean k | pen err mean k |", "|---|---|---|---|---|---|"]
@@ -97,7 +158,15 @@ def run(net, d, eps, name, tol, lines, out):
     for nm, msk in strata.items():
         if msk.sum() < 3:
             continue
-        e, pe = np.abs(pm_p[msk] - pm_t[msk]), np.abs(pen(pm_p[msk]) - pen(pm_t[msk]))
+        dpm = pm_p[msk] - pm_t[msk]
+        dpen = pen(pm_p[msk]) - pen(pm_t[msk])
+        e, pe = np.abs(dpm), np.abs(dpen)
+        out[name].setdefault("strata", {})[nm] = {
+            "n": int(msk.sum()), "pmax_abs_k6": float(e[:, -1].mean()),
+            "pmax_bias_k6": float(dpm[:, -1].mean()), "pmax_abs_mean": float(e.mean()),
+            "penalty_abs_k6": float(pe[:, -1].mean()), "penalty_bias_k6": float(dpen[:, -1].mean()),
+            "penalty_abs_mean": float(pe.mean()),
+        }
         lines.append(f"| {nm} | {int(msk.sum())} | {e[:, -1].mean():.3f} | {pe[:, -1].mean():.2f} | {e.mean():.3f} | {pe.mean():.2f} |")
 
 
