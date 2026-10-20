@@ -15,7 +15,10 @@ Design (see SURROGATE_HANDOFF.md sections 6-8):
 
 The backbone is a small U-Net ("unet"), a CCSNet-style two-decoder U-Net ("ccs"), a grid-graph message-passing
 network with permeability edge features and separate pressure/saturation heads ("gnn"), an HGNS-style split
-(U-Net for pressure, GNN for saturation: "split"), a U-Net with a ConvLSTM bottleneck ("runet") or a small FNO ("fno").
+(U-Net for pressure, GNN for saturation: "split"), coupled U-Net/GNN and FNO/GNN models ("ugnn", "fgnn"),
+a U-Net with a ConvLSTM bottleneck ("runet"), a recurrent GNN ("gnnlstm"), or a small FNO ("fno").
+For `gnnlstm`, recurrent tensors are carried in each returned state under the private `_memory` key,
+so separate rollout branches keep separate hidden states.
 
 Hybrid modes (physics_prior.py = the solver's own implicit pressure step, batched in torch):
   hybrid="none"    pure learned model (above).
@@ -79,7 +82,7 @@ class _Decoder(nn.Module):
         return self.out(self.m2(torch.cat([h, f0], 1)))
 
 
-BACKBONES = ("unet", "ccs", "gnn", "split", "runet", "fno", "ufno")
+BACKBONES = ("unet", "ccs", "gnn", "split", "ugnn", "fgnn", "runet", "gnnlstm", "fno", "ufno")
 
 _DIRS = ((0, 1), (0, -1), (1, 0), (-1, 0))        # neighbour offsets (dy, dx) of the 4-neighbour grid graph
 
@@ -141,7 +144,7 @@ class _GridGNN(nn.Module):
             out.append((torch.cat([f1, f2], 1) * m, m))
         return out
 
-    def forward(self, x):
+    def forward(self, x, return_latent=False):
         edges = self.edge_features(x)
         h = self.enc(x)
         for l in range(self.n_layers):
@@ -150,6 +153,8 @@ class _GridGNN(nn.Module):
                 e, m = edges[d]
                 agg = agg + self.msg[l][d](torch.cat([h, _shift(h, dy, dx), e], 1)) * m
             h = self.norm[l](h + self.upd[l](torch.cat([h, agg], 1)) + self.glob[l](h.mean((2, 3), keepdim=True)))
+        if return_latent:
+            return h
         return tuple(hd(h)[:, 0] for hd in self.heads)
 
 
@@ -166,6 +171,35 @@ class _Split(nn.Module):
         return self.pnet(x)[:, 0], self.snet(x)[0]
 
 
+class _CoupledGrid(nn.Module):
+    """Coupled spatial/graph surrogate with explicit pressure-transport exchange.
+
+    The first spatial branch estimates pressure change. The grid GNN predicts saturation
+    change conditioned on that pressure estimate. A second spatial pass then corrects
+    pressure conditioned on the predicted saturation change. `fgnn` uses Fourier
+    operators for global pressure context; `ugnn` uses U-Nets for a spatial CNN control.
+    Unlike the HGNS-style `split`, the branches exchange predicted state changes.
+    """
+
+    def __init__(self, in_ch, c, operator="fno"):
+        super().__init__()
+        if operator == "fno":
+            self.p0 = _FNO(in_ch, c, n_layers=4, u_layers=0)
+            self.pcorr = _FNO(in_ch + 1, c, n_layers=4, u_layers=2)
+        else:
+            self.p0 = _UNet(in_ch, c, 1)
+            self.pcorr = _UNet(in_ch + 1, c, 1)
+        self.snet = _GridGNN(in_ch + 1, c, n_layers=6, n_out=1)
+
+    def forward(self, x):
+        p0 = self.p0(x)
+        dp0 = p0[0] if isinstance(p0, tuple) else p0[:, 0]
+        ds = self.snet(torch.cat([x, dp0.unsqueeze(1)], dim=1))[0]
+        p1 = self.pcorr(torch.cat([x, ds.unsqueeze(1)], dim=1))
+        dp1 = p1[0] if isinstance(p1, tuple) else p1[:, 0]
+        return dp0 + dp1, ds
+
+
 class _ConvLSTMCell(nn.Module):
     def __init__(self, ch):
         super().__init__()
@@ -175,6 +209,33 @@ class _ConvLSTMCell(nn.Module):
         i, f, g, o = self.conv(torch.cat([x, h], 1)).chunk(4, 1)
         c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
         return torch.sigmoid(o) * torch.tanh(c), c
+
+
+class _GNNLSTM(nn.Module):
+    """Message-passing GNN with hidden/cell memory carried from stage to stage.
+
+    The GNN embeds each stage's current geometry, controls and state; an LSTM updates
+    those nodewise grid embeddings using the prior stage memory. This adapts the
+    recurrent-graph idea in MGN-LSTM to the fixed Cartesian grid used in this project.
+    """
+
+    def __init__(self, in_ch, c):
+        super().__init__()
+        self.gnn = _GridGNN(in_ch, c, n_layers=6, n_out=0)
+        self.cell = _ConvLSTMCell(c)
+        self.heads = nn.ModuleList([
+            nn.Sequential(nn.Conv2d(c, c, 1), nn.GELU(), nn.Conv2d(c, 1, 1))
+            for _ in range(2)
+        ])
+
+    def forward(self, x, memory=None):
+        z = self.gnn(x, return_latent=True)
+        if memory is None:
+            h0, c0 = torch.zeros_like(z), torch.zeros_like(z)
+        else:
+            h0, c0 = memory
+        h, c = self.cell(z, h0, c0)
+        return tuple(head(h)[:, 0] for head in self.heads), (h, c)
 
 
 class _RUNet(nn.Module):
@@ -265,6 +326,9 @@ class _FNO(nn.Module):
 
 def _make_core(backbone, in_ch, c):
     return {"gnn": lambda: _GridGNN(in_ch, c, n_out=2), "split": lambda: _Split(in_ch, c),
+            "ugnn": lambda: _CoupledGrid(in_ch, c, operator="unet"),
+            "fgnn": lambda: _CoupledGrid(in_ch, c, operator="fno"),
+            "gnnlstm": lambda: _GNNLSTM(in_ch, c),
             "runet": lambda: _RUNet(in_ch, c), "fno": lambda: _FNO(in_ch, c),
             "ufno": lambda: _FNO(in_ch, c, u_layers=2)}[backbone]()
 
@@ -309,22 +373,38 @@ class StageNet(nn.Module):
         return cls(blob.get("backbone", "unet"), blob.get("width", 48), blob.get("hybrid", "none"),
                    blob.get("n_sub", 8), blob.get("stage_time", 1.0))
 
-    def step(self, k, phi, well_rate, p_in, sw_in):
-        """Physical-units one-step prediction: returns (p_out, sw_out) tensors [B,H,W]."""
+    def step(self, k, phi, well_rate, p_in, sw_in, memory=None, return_memory=False):
+        """Physical-units prediction; recurrent GNN may carry memory across stages."""
         if self.hybrid != "none" and k.shape[0] > 256:      # keep the dense [B,144,144] systems small
-            outs = [self.step(*(a[i:i + 256] for a in (k, phi, well_rate, p_in, sw_in))) for i in range(0, k.shape[0], 256)]
-            return torch.cat([o[0] for o in outs]), torch.cat([o[1] for o in outs])
+            outs = []
+            for i in range(0, k.shape[0], 256):
+                mem = None if memory is None else tuple(v[i:i + 256] for v in memory)
+                outs.append(self.step(*(a[i:i + 256] for a in (k, phi, well_rate, p_in, sw_in)),
+                                      memory=mem, return_memory=return_memory))
+            pred = (torch.cat([o[0] for o in outs]), torch.cat([o[1] for o in outs]))
+            if not return_memory:
+                return pred
+            mem_out = None if outs[0][2] is None else tuple(torch.cat([o[2][j] for o in outs]) for j in range(2))
+            return (*pred, mem_out)
         x = encode(k, phi, well_rate, p_in, sw_in)
+        def predict(z):
+            if self.backbone == "gnnlstm":
+                return self.core(z, memory)
+            dp, ds = self(z)
+            return (dp, ds), memory
+
         if self.hybrid == "none":
-            dp, ds = self(x)
-            return p_in + dp * DP_SCALE, (sw_in + ds * DS_SCALE).clamp(SWC, 1 - SOR)
+            (dp, ds), memory_out = predict(x)
+            out = (p_in + dp * DP_SCALE, (sw_in + ds * DS_SCALE).clamp(SWC, 1 - SOR))
+            return (*out, memory_out) if return_memory else out
         with torch.no_grad():                 # the frozen-lambda prior is a function of the inputs only
             p_a = pressure_prior(k, phi, sw_in, well_rate, p_in, self.stage_time, self.n_sub, dtype=torch.float32)
-        dp, ds = self(torch.cat([x, ((p_a - p_in) / DP_SCALE).unsqueeze(1)], 1))
+        (dp, ds), memory_out = predict(torch.cat([x, ((p_a - p_in) / DP_SCALE).unsqueeze(1)], 1))
         sw_out = (sw_in + ds * DS_SCALE).clamp(SWC, 1 - SOR)
         base = p_a if self.hybrid == "prior" else pressure_prior(k, phi, sw_in, well_rate, p_in, self.stage_time,
                                                                  self.n_sub, sw_end=sw_out, dtype=torch.float32)
-        return base + dp * RES_SCALE, sw_out
+        out = (base + dp * RES_SCALE, sw_out)
+        return (*out, memory_out) if return_memory else out
 
 
 class StageSurrogate:
@@ -351,5 +431,11 @@ class StageSurrogate:
         for i, j, r in wells:
             wr[i, j] += r
         t = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=self.device)[None]
-        p, sw = self.net.step(t(geo["k"]), t(geo["phi"]), t(wr), t(state["p"]), t(state["Sw"]))
-        return {"p": p[0].double().cpu().numpy(), "Sw": sw[0].double().cpu().numpy()}, self.stage_time
+        mem_np = state.get("_memory")
+        memory = None if mem_np is None else tuple(t(a) for a in mem_np)
+        p, sw, memory_out = self.net.step(t(geo["k"]), t(geo["phi"]), t(wr), t(state["p"]), t(state["Sw"]),
+                                          memory=memory, return_memory=True)
+        nxt = {"p": p[0].double().cpu().numpy(), "Sw": sw[0].double().cpu().numpy()}
+        if memory_out is not None:
+            nxt["_memory"] = tuple(h[0].cpu().numpy() for h in memory_out)
+        return nxt, self.stage_time

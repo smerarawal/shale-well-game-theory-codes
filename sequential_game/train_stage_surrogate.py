@@ -50,10 +50,12 @@ def loss_unroll(net, D, idx, L, hi_w, pmax_w, sat_w):
     previous PREDICTED state, gradients flow through the physics solves) and average the per-stage loss.
     Rows are episode-major with T stages each, so row idx+j is stage j of the same episode."""
     p, sw = D["p_in"][idx], D["sw_in"][idx]
+    memory = None
     tot = 0.0
     for j in range(L):
         r = idx + j
-        p, sw = net.step(D["k"][idx], D["phi"][idx], D["wr"][r], p, sw)
+        p, sw, memory = net.step(D["k"][idx], D["phi"][idx], D["wr"][r], p, sw,
+                                 memory=memory, return_memory=True)
         b = {"p_out": D["p_out"][r], "sw_out": D["sw_out"][r]}
         tot = tot + loss_terms(p, sw, b, hi_w, pmax_w, sat_w)[0]
     return tot / L
@@ -76,6 +78,28 @@ def loss_terms(p, sw, b, hi_w, pmax_w, sat_w):
 @torch.no_grad()
 def evaluate(net, data, bs=512):
     net.eval()
+    if net.backbone == "gnnlstm":
+        # Evaluate recurrent models on true episode boundaries and their actual
+        # autoregressive state/memory rollout, rather than resetting hidden state per row.
+        T = 6
+        E = data["k"].shape[0] // T
+        p_errors, pmax_errors, sw_errors = [], [], []
+        for i in range(0, E, max(1, bs // T)):
+            starts = torch.arange(i, min(i + max(1, bs // T), E), device=data["k"].device) * T
+            p, sw, memory = data["p_in"][starts], data["sw_in"][starts], None
+            for s in range(T):
+                r = starts + s
+                p, sw, memory = net.step(data["k"][starts], data["phi"][starts], data["wr"][r], p, sw,
+                                         memory=memory, return_memory=True)
+                p_errors.append(((p - data["p_out"][r]) ** 2).flatten(1).mean(1))
+                pmax_errors.append(p.flatten(1).amax(1) - data["p_out"][r].flatten(1).amax(1))
+                sw_errors.append(((sw - data["sw_out"][r]) ** 2).flatten(1).mean(1))
+        pe = torch.cat(p_errors)
+        pm = torch.cat(pmax_errors)
+        se = torch.cat(sw_errors)
+        return {"p_rmse": float(torch.cat([x for x in p_errors]).sqrt().mean()),
+                "pmax_abs": float(pm.abs().mean()), "pmax_bias": float(pm.mean()),
+                "sw_rmse": float(se.sqrt().mean())}
     se, pe, ae = [], [], []
     for i in range(0, data["k"].shape[0], bs):
         b = {k: v[i:i + bs] for k, v in data.items()}
@@ -96,7 +120,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--backbone", default="unet", choices=list(BACKBONES))
     ap.add_argument("--unroll", type=int, default=1,
-                    help="train on L chained stage predictions (gradients through the solves); 1 = one-step teacher forcing")
+                    help="train on L chained stage predictions (gradients through solves and recurrent state); 1 = one-step teacher forcing")
     ap.add_argument("--width", type=int, default=48)
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -107,6 +131,8 @@ def main():
     ap.add_argument("--sat_w", type=float, default=0.5)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
+    if a.backbone == "gnnlstm" and a.unroll < 2:
+        ap.error("gnnlstm needs --unroll >= 2 to train its cross-stage hidden state")
 
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)

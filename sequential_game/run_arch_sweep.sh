@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# run_arch_sweep.sh -- which learned backbone works best INSIDE the physics hybrid?
+# run_arch_sweep.sh -- mix-only architecture sweep. For the unified architecture x
+# hybrid x game/mix run, use run_consolidated_sweep.sh.
 #
-# Backbones (stage_surrogate.py):  unet (reference, = the hybrid that worked), ccs, gnn, split, runet, fno, ufno.
+# Backbones (stage_surrogate.py): unet, ccs, gnn, split, ugnn (coupled U-Net/GNN), fgnn (coupled FNO/GNN),
+# runet, fno, ufno. The coupled variants pass predicted pressure change into the saturation GNN and feed
+# its saturation change back into a pressure correction.
 # Training data: game fields + SPE10 train band ("mix"); eval: game truths, SPE10 Tarbert / Upper Ness test band.
 # Standalone: regenerates the data if $OUT does not already hold it (reuses it otherwise).
 #
-#   bash run_arch_sweep.sh                                   # 7 backbones x {none, prior, prior2}, seed 0, 60 epochs
+#   bash run_arch_sweep.sh                                   # 10 backbones x {none, prior, prior2}, seed 0, 60 epochs
 #   HYBRIDS="prior2" bash run_arch_sweep.sh                  # only the full hybrid (about 1/3 of the time)
 #   BACKBONES="gnn split" UNROLL=3 bash run_arch_sweep.sh    # multi-stage (3 chained stages) training
 #   WIDTH=96 BACKBONES="gnn" bash run_arch_sweep.sh          # size-matched GNN
@@ -21,7 +24,7 @@ SEEDS=${SEEDS:-"0"}
 EPOCHS=${EPOCHS:-60}
 WORKERS=${WORKERS:-4}
 NEP=${NEP:-3000}
-BACKBONES=${BACKBONES:-"unet ccs gnn split runet fno ufno"}
+BACKBONES=${BACKBONES:-"unet ccs gnn split ugnn fgnn runet gnnlstm fno ufno"}
 HYBRIDS=${HYBRIDS:-"none prior prior2"}
 UNROLL=${UNROLL:-1}
 WIDTH=${WIDTH:-48}      # e.g. WIDTH=96 BACKBONES=gnn for a size-matched GNN (0.23M params at 48 vs 1.2-1.9M for the others)
