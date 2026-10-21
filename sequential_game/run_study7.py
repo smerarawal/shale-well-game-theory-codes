@@ -61,8 +61,8 @@ def plan(tiers="ABCD"):
                                 {**BASE, "cap_total": float(cap)}, "coop"))
         # D: margins and price instruments; price is charged in Nash private payoffs only.
         for margins_tag, margins in (("equal", (20.0, 20.0)),
-                                     ("op0_high", (24.0, 16.0)),
-                                     ("op1_high", (28.0, 12.0))):
+                                     ("op0_high_24_16", (24.0, 16.0)),
+                                     ("op0_high_28_12", (28.0, 12.0))):
             for price in (0.0, 5.0, 10.0):
                 out["D"].append(job("e21", f"{margins_tag}_price{price:g}", g,
                                     {**BASE, "margins": margins, "inj_price": price}, "nash"))

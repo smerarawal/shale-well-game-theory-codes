@@ -73,7 +73,7 @@ def main(folder):
             lines.append(f"| {cap}/{rule} | {len(ids)} | {ci(dw) if ids else '—'} | {ci(dv) if ids else '—'} |")
     lines += ["", "Read stage-level requested_vol and served_vol in JSON to see whether a rule changes requests, the distribution of curtailment, or only final totals.", "",
               "## Experiment 21 — heterogeneous margins and price", "", "| margins | arm | n | welfare mean [95% CI] | operator 0 net payoff | operator 1 net payoff |", "|---|---|---:|---:|---:|---:|"]
-    for margin_tag in ("equal", "op0_high", "op1_high"):
+    for margin_tag in ("equal", "op0_high_24_16", "op0_high_28_12"):
         for arm in ("price0", "price5", "price10", "fixed"):
             rs = list(rows.get(("e21", f"{margin_tag}_{arm}"), {}).values())
             if not rs:
@@ -81,7 +81,7 @@ def main(folder):
                 continue
             lines.append(f"| {margin_tag} | {arm} | {len(rs)} | {ci([r['welfare'] for r in rs])} | {np.mean([r['payoff_net_price'][0] for r in rs]):.3f} | {np.mean([r['payoff_net_price'][1] for r in rs]):.3f} |")
     lines += ["", "Paired price effects relative to the same-margin price0 arm:", "", "| margins | price | paired n | resource-welfare change [95% CI] |", "|---|---:|---:|---:|"]
-    for margin_tag in ("equal", "op0_high", "op1_high"):
+    for margin_tag in ("equal", "op0_high_24_16", "op0_high_28_12"):
         for price in (5, 10):
             ids, change = paired(rows, ("e21", f"{margin_tag}_price{price}"), ("e21", f"{margin_tag}_price0"))
             lines.append(f"| {margin_tag} | {price} | {len(ids)} | {ci(change)} |" if ids else f"| {margin_tag} | {price} | 0 | — |")
