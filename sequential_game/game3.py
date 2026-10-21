@@ -87,6 +87,8 @@ class Cfg:
     inj_price: float = 0.0     # per-unit injected volume charge seen by Nash players only (a transfer: welfare ignores it)
     alloc: bool = False        # permit split into equal fixed per-operator allowances (no pro-rata race)
     br_rounds: int = 3         # max rounds of iterated best response
+    rationing_rule: str = "prorata"  # prorata, cea, cel, or fixed
+    margins: tuple = None      # optional per-operator revenue margins
 
     def __post_init__(self):
         if self.layout != "v2":
@@ -123,28 +125,59 @@ def play_stage(model, geo, state, wells, rates, new_wells, cfg):
     cum = state.get("cum", 0.0)
     rates = tuple(rates)
     cum_o = np.asarray(state.get("cum_o", np.zeros(cfg.n_ops)), float)
+    requested_rates = tuple(rates)
+    requested_vol = np.zeros(cfg.n_ops)
+    for o, _, _ in wells:
+        requested_vol[o] += requested_rates[o] * cfg.stage_time
     if np.isfinite(cfg.cap_total):  # shared permit
         nw = np.zeros(cfg.n_ops)
         for o, _, _ in wells:
             nw[o] += 1
-        if cfg.alloc:  # equal fixed allowances: each operator is curtailed only by its own cumulative volume
+        rule = "fixed" if cfg.alloc else cfg.rationing_rule
+        if rule == "fixed":  # equal fixed allowances: each operator is curtailed only by its own cumulative volume
             fs = []
             for o in range(cfg.n_ops):
                 req_o = rates[o] * cfg.stage_time * nw[o]
                 allow_o = max(0.0, cfg.cap_total / cfg.n_ops - cum_o[o])
                 fs.append(1.0 if (req_o <= allow_o + 1e-12 or req_o <= 0) else allow_o / req_o)
             rates = tuple(r * f for r, f in zip(rates, fs))
-        else:  # shared pool: curtail every operator pro rata if it would be exceeded
+        elif rule == "prorata":  # shared pool: curtail every operator pro rata if it would be exceeded
             req = float(sum(rates[o] * cfg.stage_time * nw[o] for o in range(cfg.n_ops)))
             allowed = max(0.0, cfg.cap_total - cum)
             f = 1.0 if (req <= allowed + 1e-12 or req <= 0) else allowed / req
             rates = tuple(r * f for r in rates)
+        elif rule in ("cea", "cel"):
+            req = np.array([rates[o] * cfg.stage_time * nw[o] for o in range(cfg.n_ops)], float)
+            allowed = min(max(0.0, cfg.cap_total - cum), float(req.sum()))
+            if rule == "cea":  # constrained equal awards: equalize service, cap at each request
+                lo, hi = 0.0, float(req.max()) if len(req) else 0.0
+                for _ in range(60):
+                    mid = (lo + hi) / 2
+                    if np.minimum(req, mid).sum() < allowed:
+                        lo = mid
+                    else:
+                        hi = mid
+                served = np.minimum(req, (lo + hi) / 2)
+            else:  # constrained equal losses: equalize curtailment, floor at zero
+                lo, hi = 0.0, float(req.max()) if len(req) else 0.0
+                for _ in range(60):
+                    mid = (lo + hi) / 2
+                    if np.maximum(req - mid, 0).sum() > allowed:
+                        lo = mid
+                    else:
+                        hi = mid
+                served = np.maximum(req - (lo + hi) / 2, 0)
+            factors = np.divide(served, req, out=np.zeros_like(served), where=req > 0)
+            rates = tuple(r * factors[o] for o, r in enumerate(rates))
+        else:
+            raise ValueError("rationing_rule must be prorata, cea, cel, or fixed")
     active = [(i, j, max(rates[o], 1e-6)) for o, i, j in wells]
     nxt, t = model.advance(geo, state, active)
     gross = np.zeros(cfg.n_ops)
     vol = np.zeros(cfg.n_ops)
     for o, _, _ in wells:
-        gross[o] += cfg.margin * rates[o] * t
+        margin = cfg.margin if cfg.margins is None else cfg.margins[o]
+        gross[o] += margin * rates[o] * t
         vol[o] += rates[o] * t
     drill = np.zeros(cfg.n_ops)
     for o, _, _ in new_wells:
@@ -161,7 +194,8 @@ def play_stage(model, geo, state, wells, rates, new_wells, cfg):
     nxt = dict(nxt)
     nxt["cum"] = cum + float(vol.sum())
     nxt["cum_o"] = cum_o + vol
-    return nxt, {"gross": gross, "drill": drill, "pen": pen, "share": share, "pmax": pmax, "vol": vol}
+    return nxt, {"gross": gross, "drill": drill, "pen": pen, "share": share, "pmax": pmax, "vol": vol,
+                 "requested_vol": requested_vol, "served_vol": vol.copy(), "served_rates": list(rates)}
 
 
 def payoff(c, cfg, mult=1.0, price=0.0):
@@ -385,7 +419,7 @@ def predictive_diag(belief, obs, wells, cfg):
 
 
 def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None, prefix=None,
-                pool_seeds=(11, 12, 13, 14)):
+                pool_seeds=(11, 12, 13, 14), capture_states=False):
     """force={t: {op: (rate, drill_flag)}} overrides one operator's action at stage t AFTER planning
     (others keep the planner's action). prefix=[joint,...] replays given joints for the first stages
     instead of planning (used by the one-shot-deviation check)."""
@@ -397,7 +431,7 @@ def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None
     wells = tuple((o,) + tuple(cfg.init_sites[o]) for o in range(cfg.n_ops))
     n_new = [0] * cfg.n_ops
     prev_rates = [1.0] * cfg.n_ops
-    total, log = np.zeros(cfg.n_ops), []
+    total, net_total, log = np.zeros(cfg.n_ops), np.zeros(cfg.n_ops), []
     inj = np.zeros(cfg.n_ops)
     pmax_hist, viol = [], 0.0
     for t in range(cfg.T):
@@ -417,9 +451,14 @@ def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None
             n_new[o] += 1
         wells = wells + new
         prev_rates = list(rates)
+        state_before = true_state
+        if capture_states:
+            state_before = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in true_state.items()}
         true_state, c = play_stage(model, true_geo, true_state, wells, rates, new, cfg)
         r = payoff(c, cfg, 1.0)
+        net_r = payoff(c, cfg, 1.0, cfg.inj_price if mode == "nash" else 0.0)
         total += cfg.gamma ** t * r
+        net_total += cfg.gamma ** t * net_r
         inj += c["vol"]
         pmax_hist.append(c["pmax"])
         viol += max(0.0, c["pmax"] - cfg.p_cap)
@@ -429,12 +468,23 @@ def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None
             obs = np.array([true_state["p"][i, j] for _, i, j in wells]) + rng.normal(0, cfg.sigma_obs, len(wells))
             diag = predictive_diag(belief, obs, wells, cfg)   # BEFORE the update: honest predictive check
             belief.update(obs, wells, cfg)
-        log.append({**diag, "stage": t, "rates": list(rates), "new_wells": [list(w) for w in new],
+        entry = {**diag, "stage": t, "rates": list(rates), "served_rates": c["served_rates"],
+                    "requested_vol": c["requested_vol"].round(6).tolist(), "served_vol": c["served_vol"].round(6).tolist(),
+                    "cum_permit": round(float(true_state.get("cum", 0.0)), 6),
+                    "new_wells": [list(w) for w in new],
                     "joint": [[a[0], list(a[1]) if a[1] is not None else None] for a in joint],
                     "reward": r.round(2).tolist(), "pmax": round(c["pmax"], 2),
+                    "net_reward": net_r.round(2).tolist(), "gross": c["gross"].round(4).tolist(),
+                    "drill": c["drill"].round(4).tolist(), "liability": float(c["pen"]),
+                    "liability_share": c["share"].round(6).tolist(), "price_transfer": (cfg.inj_price * c["vol"]).round(4).tolist(),
                     "ess": round(belief.ess(), 2), "mult_hat": round(belief.mult_mean(), 3),
-                    "q05": round(belief.mult_q(0.05), 3), "q95": round(belief.mult_q(0.95), 3)})
-    summary = {"payoff": total.tolist(), "welfare": float(total.sum()), "injected": inj.tolist(),
+                    "q05": round(belief.mult_q(0.05), 3), "q95": round(belief.mult_q(0.95), 3)}
+        if capture_states:
+            entry["state_in"] = {k: np.asarray(v).tolist() for k, v in state_before.items() if isinstance(v, np.ndarray)}
+            entry["state_out"] = {k: np.asarray(v).tolist() for k, v in true_state.items() if isinstance(v, np.ndarray)}
+        log.append(entry)
+    summary = {"payoff": total.tolist(), "welfare": float(total.sum()), "payoff_net_price": net_total.tolist(),
+               "net_welfare_after_price_transfer": float(net_total.sum()), "injected": inj.tolist(),
                "total_injected": float(inj.sum()), "n_wells": len(wells), "pmax_peak": float(max(pmax_hist)),
                "cap_violation": float(viol), "gini_gap": float(abs(total[0] - total[-1])),
                "n_rejuv": int(getattr(belief, "n_rejuv", 0))}

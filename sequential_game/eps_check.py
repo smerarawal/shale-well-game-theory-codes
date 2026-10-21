@@ -72,6 +72,49 @@ def open_loop_eps(model, cfg, geo, sched, objective="own", sweeps=2):
     return out
 
 
+def two_stage_block_eps(model, cfg, geo, sched, sweeps=1):
+    """Greedy unilateral deviation search that changes two adjacent stages jointly.
+
+    Other operators' complete schedules stay fixed. Each candidate block enumerates the
+    Cartesian product of the configured rate levels and (no drill, next preferred site).
+    This remains a lower bound on equilibrium epsilon; it is stronger than one-stage moves,
+    but it does not enumerate arbitrary full-horizon schedules.
+    """
+    base = simulate_schedule(model, cfg, geo, sched)
+    out = {"base_payoff": base.tolist(), "base_welfare": float(base.sum()),
+           "move_set": "unilateral adjacent two-stage blocks", "sweeps": int(sweeps),
+           "candidate_simulations": 0}
+    rates = cfg.rates if cfg.n_ops <= 2 else (0.0, 1.0)
+    actions = [(r, d) for r in rates for d in (None, "dyn")]
+    for op in range(cfg.n_ops):
+        cur = copy.deepcopy(sched)
+        curv = float(base[op])
+        tried = 0
+        for _ in range(sweeps):
+            improved = False
+            for t in range(max(1, cfg.T - 1)):
+                end = min(t + 2, cfg.T)
+                bestv, best = curv, None
+                for a0 in actions:
+                    for a1 in (actions if end - t == 2 else (None,)):
+                        trial = copy.deepcopy(cur)
+                        trial[t][op] = a0
+                        if a1 is not None:
+                            trial[t + 1][op] = a1
+                        vals = simulate_schedule(model, cfg, geo, trial)
+                        tried += 1
+                        if vals[op] > bestv + 1e-9:
+                            bestv, best = float(vals[op]), trial
+                if best is not None:
+                    cur, curv, improved = best, bestv, True
+            if not improved:
+                break
+        out[f"op{op}"] = max(0.0, curv - float(base[op]))
+        out["candidate_simulations"] += tried
+    out["max"] = max(out[f"op{o}"] for o in range(cfg.n_ops))
+    return out
+
+
 def osd_eps(model, cfg, geo, t0, mode="nash", seed=0, pool=None, base=None):
     """One-shot-deviation epsilon at stage t0 on the planner's own path (oracle information)."""
     if base is None:
