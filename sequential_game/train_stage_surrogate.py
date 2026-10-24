@@ -78,7 +78,7 @@ def loss_terms(p, sw, b, hi_w, pmax_w, sat_w):
 @torch.no_grad()
 def evaluate(net, data, bs=512):
     net.eval()
-    if net.backbone == "gnnlstm":
+    if net.backbone in ("gnnlstm", "ccslstm"):
         # Evaluate recurrent models on true episode boundaries and their actual
         # autoregressive state/memory rollout, rather than resetting hidden state per row.
         T = 6
@@ -131,8 +131,8 @@ def main():
     ap.add_argument("--sat_w", type=float, default=0.5)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
-    if a.backbone == "gnnlstm" and a.unroll < 2:
-        ap.error("gnnlstm needs --unroll >= 2 to train its cross-stage hidden state")
+    if a.backbone in ("gnnlstm", "ccslstm") and a.unroll < 2:
+        ap.error(f"{a.backbone} needs --unroll >= 2 to train its cross-stage hidden state")
 
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)

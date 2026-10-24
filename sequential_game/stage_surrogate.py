@@ -16,9 +16,10 @@ Design (see SURROGATE_HANDOFF.md sections 6-8):
 The backbone is a small U-Net ("unet"), a CCSNet-style two-decoder U-Net ("ccs"), a grid-graph message-passing
 network with permeability edge features and separate pressure/saturation heads ("gnn"), an HGNS-style split
 (U-Net for pressure, GNN for saturation: "split"), coupled U-Net/GNN and FNO/GNN models ("ugnn", "fgnn"),
-a U-Net with a ConvLSTM bottleneck ("runet"), a recurrent GNN ("gnnlstm"), or a small FNO ("fno").
-For `gnnlstm`, recurrent tensors are carried in each returned state under the private `_memory` key,
-so separate rollout branches keep separate hidden states.
+a U-Net with a within-stage ConvLSTM bottleneck ("runet"), a recurrent GNN ("gnnlstm"), a CCS encoder-decoder
+with stage-to-stage ConvLSTM memory ("ccslstm"), a CCS/FNO global-local model ("ccsfno"), or a small FNO ("fno").
+For recurrent backbones, tensors are carried in each returned state under the private `_memory` key, so
+separate rollout branches keep separate hidden states.
 
 Hybrid modes (physics_prior.py = the solver's own implicit pressure step, batched in torch):
   hybrid="none"    pure learned model (above).
@@ -82,7 +83,7 @@ class _Decoder(nn.Module):
         return self.out(self.m2(torch.cat([h, f0], 1)))
 
 
-BACKBONES = ("unet", "ccs", "gnn", "split", "ugnn", "fgnn", "runet", "gnnlstm", "fno", "ufno")
+BACKBONES = ("unet", "ccs", "gnn", "split", "ugnn", "fgnn", "runet", "gnnlstm", "ccslstm", "ccsfno", "fno", "ufno")
 
 _DIRS = ((0, 1), (0, -1), (1, 0), (-1, 0))        # neighbour offsets (dy, dx) of the 4-neighbour grid graph
 
@@ -238,6 +239,31 @@ class _GNNLSTM(nn.Module):
         return tuple(head(h)[:, 0] for head in self.heads), (h, c)
 
 
+class _CCSLSTM(nn.Module):
+    """CCSNet-style dual-decoder encoder with ConvLSTM memory carried between stages."""
+
+    def __init__(self, in_ch, c):
+        super().__init__()
+        self.e0 = nn.Sequential(_block(in_ch, c), _block(c, c))
+        self.e1 = nn.Sequential(_block(c, c * 2, stride=2), _block(c * 2, c * 2))
+        self.e2 = nn.Sequential(_block(c * 2, c * 4, stride=2), _block(c * 4, c * 4))
+        self.cell = _ConvLSTMCell(c * 4)
+        self.dp = _Decoder(c, 1)
+        self.ds = _Decoder(c, 1)
+
+    def forward(self, x, memory=None):
+        f0 = self.e0(x)
+        f1 = self.e1(f0)
+        f2 = self.e2(f1)
+        if memory is None:
+            h0, c0 = torch.zeros_like(f2), torch.zeros_like(f2)
+        else:
+            h0, c0 = memory
+        h, c = self.cell(f2, h0, c0)
+        latent = f2 + h
+        return (self.dp(f0, f1, latent)[:, 0], self.ds(f0, f1, latent)[:, 0]), (h, c)
+
+
 class _RUNet(nn.Module):
     """R-U-Net flavour: U-Net whose bottleneck is refined by a ConvLSTM unrolled n_rec times within the stage
     (the hidden state is reset every stage: the game state (p, Sw) is already Markov)."""
@@ -324,11 +350,58 @@ class _FNO(nn.Module):
         return tuple(hd(h)[:, 0] for hd in self.heads)
 
 
+class _FourierContext(nn.Module):
+    """FNO feature trunk returning a spatial latent field for fusion with CCSNet."""
+
+    def __init__(self, in_ch, c, modes=6, n_layers=4):
+        super().__init__()
+        self.lift = nn.Conv2d(in_ch + 2, c, 1)
+        self.spec = nn.ModuleList([_SpectralConv2d(c, c, modes) for _ in range(n_layers)])
+        self.pw = nn.ModuleList([nn.Conv2d(c, c, 1) for _ in range(n_layers)])
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+        gy = torch.linspace(0, 1, H, device=x.device, dtype=x.dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+        gx = torch.linspace(0, 1, W, device=x.device, dtype=x.dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        h = self.lift(torch.cat([x, gy, gx], 1))
+        for l, (s, p) in enumerate(zip(self.spec, self.pw)):
+            h = s(h) + p(h)
+            if l < len(self.spec) - 1:
+                h = F.gelu(h)
+        return h
+
+
+class _CCSFNO(nn.Module):
+    """CCSNet local decoder fused with a Fourier branch for long-range spatial context."""
+
+    def __init__(self, in_ch, c):
+        super().__init__()
+        self.e0 = nn.Sequential(_block(in_ch, c), _block(c, c))
+        self.e1 = nn.Sequential(_block(c, c * 2, stride=2), _block(c * 2, c * 2))
+        self.e2 = nn.Sequential(_block(c * 2, c * 4, stride=2), _block(c * 4, c * 4))
+        self.fourier = _FourierContext(in_ch, c)
+        self.context = nn.Conv2d(c, c * 4, 1)
+        self.dp = _Decoder(c, 1)
+        self.ds = _Decoder(c, 1)
+
+    def forward(self, x):
+        f0 = self.e0(x)
+        f1 = self.e1(f0)
+        f2 = self.e2(f1)
+        global_context = self.fourier(x)
+        if global_context.shape[-2:] != f2.shape[-2:]:
+            global_context = F.interpolate(global_context, size=f2.shape[-2:], mode="bilinear", align_corners=False)
+        latent = f2 + self.context(global_context)
+        return self.dp(f0, f1, latent)[:, 0], self.ds(f0, f1, latent)[:, 0]
+
+
 def _make_core(backbone, in_ch, c):
     return {"gnn": lambda: _GridGNN(in_ch, c, n_out=2), "split": lambda: _Split(in_ch, c),
             "ugnn": lambda: _CoupledGrid(in_ch, c, operator="unet"),
             "fgnn": lambda: _CoupledGrid(in_ch, c, operator="fno"),
             "gnnlstm": lambda: _GNNLSTM(in_ch, c),
+            "ccslstm": lambda: _CCSLSTM(in_ch, c),
+            "ccsfno": lambda: _CCSFNO(in_ch, c),
             "runet": lambda: _RUNet(in_ch, c), "fno": lambda: _FNO(in_ch, c),
             "ufno": lambda: _FNO(in_ch, c, u_layers=2)}[backbone]()
 
@@ -388,7 +461,7 @@ class StageNet(nn.Module):
             return (*pred, mem_out)
         x = encode(k, phi, well_rate, p_in, sw_in)
         def predict(z):
-            if self.backbone == "gnnlstm":
+            if self.backbone in ("gnnlstm", "ccslstm"):
                 return self.core(z, memory)
             dp, ds = self(z)
             return (dp, ds), memory
