@@ -45,7 +45,7 @@ def flatten(d, eps):
             "sw_in": f(d["Sw_in"][eps]), "p_out": f(d["p_out"][eps]), "sw_out": f(d["Sw_out"][eps])}
 
 
-def loss_unroll(net, D, idx, L, hi_w, pmax_w, sat_w):
+def loss_unroll(net, D, idx, L, hi_w, pmax_w, sat_w, penalty_w=0.0):
     """Multi-stage loss: start from the TRUE state at row idx, chain L stage predictions (each fed with the
     previous PREDICTED state, gradients flow through the physics solves) and average the per-stage loss.
     Rows are episode-major with T stages each, so row idx+j is stage j of the same episode."""
@@ -57,22 +57,28 @@ def loss_unroll(net, D, idx, L, hi_w, pmax_w, sat_w):
         p, sw, memory = net.step(D["k"][idx], D["phi"][idx], D["wr"][r], p, sw,
                                  memory=memory, return_memory=True)
         b = {"p_out": D["p_out"][r], "sw_out": D["sw_out"][r]}
-        tot = tot + loss_terms(p, sw, b, hi_w, pmax_w, sat_w)[0]
+        tot = tot + loss_terms(p, sw, b, hi_w, pmax_w, sat_w, penalty_w)[0]
     return tot / L
 
 
-def loss_fn(net, b, hi_w, pmax_w, sat_w):
+def loss_fn(net, b, hi_w, pmax_w, sat_w, penalty_w=0.0):
     p, sw = net.step(b["k"], b["phi"], b["wr"], b["p_in"], b["sw_in"])
-    return loss_terms(p, sw, b, hi_w, pmax_w, sat_w)
+    return loss_terms(p, sw, b, hi_w, pmax_w, sat_w, penalty_w)
 
 
-def loss_terms(p, sw, b, hi_w, pmax_w, sat_w):
+def loss_terms(p, sw, b, hi_w, pmax_w, sat_w, penalty_w=0.0):
     ramp = ((b["p_out"] - 3.0) / 3.0).clamp(0, 1)                       # 0 below p=3, 1 above p=6
     lp = ((1 + hi_w * ramp) * (p - b["p_out"]) ** 2).mean() / P_SCALE ** 2
     pm_p, pm_t = p.flatten(1).amax(1), b["p_out"].flatten(1).amax(1)
     lm = ((pm_p - pm_t) ** 2).mean() / P_SCALE ** 2
     ls = ((sw - b["sw_out"]) ** 2).mean() / (1 - SOR - SWC) ** 2
-    return lp + pmax_w * lm + sat_w * ls, lp, lm, ls
+    # Compare the actual welfare penalty on a compressed scale. The direct p_max
+    # term above retains a useful gradient when predictions fall below the cap.
+    pen_p = 30.0 * torch.relu(pm_p - 6.0).square()
+    pen_t = 30.0 * torch.relu(pm_t - 6.0).square()
+    lpen = torch.nn.functional.smooth_l1_loss(torch.log1p(pen_p / 2.0),
+                                               torch.log1p(pen_t / 2.0))
+    return lp + pmax_w * lm + sat_w * ls + penalty_w * lpen, lp, lm, ls, lpen
 
 
 @torch.no_grad()
@@ -83,7 +89,7 @@ def evaluate(net, data, bs=512):
         # autoregressive state/memory rollout, rather than resetting hidden state per row.
         T = 6
         E = data["k"].shape[0] // T
-        p_errors, pmax_errors, sw_errors = [], [], []
+        p_errors, pmax_errors, sw_errors, penalty_errors = [], [], [], []
         for i in range(0, E, max(1, bs // T)):
             starts = torch.arange(i, min(i + max(1, bs // T), E), device=data["k"].device) * T
             p, sw, memory = data["p_in"][starts], data["sw_in"][starts], None
@@ -92,24 +98,38 @@ def evaluate(net, data, bs=512):
                 p, sw, memory = net.step(data["k"][starts], data["phi"][starts], data["wr"][r], p, sw,
                                          memory=memory, return_memory=True)
                 p_errors.append(((p - data["p_out"][r]) ** 2).flatten(1).mean(1))
-                pmax_errors.append(p.flatten(1).amax(1) - data["p_out"][r].flatten(1).amax(1))
+                pm = p.flatten(1).amax(1)
+                pm_true = data["p_out"][r].flatten(1).amax(1)
+                pmax_errors.append(pm - pm_true)
+                penalty_errors.append(30.0 * torch.relu(pm - 6.0).square() -
+                                      30.0 * torch.relu(pm_true - 6.0).square())
                 sw_errors.append(((sw - data["sw_out"][r]) ** 2).flatten(1).mean(1))
         pe = torch.cat(p_errors)
         pm = torch.cat(pmax_errors)
         se = torch.cat(sw_errors)
+        pen = torch.cat(penalty_errors)
         return {"p_rmse": float(torch.cat([x for x in p_errors]).sqrt().mean()),
                 "pmax_abs": float(pm.abs().mean()), "pmax_bias": float(pm.mean()),
-                "sw_rmse": float(se.sqrt().mean())}
-    se, pe, ae = [], [], []
+                "sw_rmse": float(se.sqrt().mean()), "penalty_abs": float(pen.abs().mean()),
+                "penalty_bias": float(pen.mean()),
+                "frac_pen_err_le_2": float((pen.abs() <= 2.0).float().mean())}
+    se, pe, ae, pen_err = [], [], [], []
     for i in range(0, data["k"].shape[0], bs):
         b = {k: v[i:i + bs] for k, v in data.items()}
         p, sw = net.step(b["k"], b["phi"], b["wr"], b["p_in"], b["sw_in"])
         se.append(((p - b["p_out"]) ** 2).flatten(1).mean(1))
         pe.append(p.flatten(1).amax(1) - b["p_out"].flatten(1).amax(1))
         ae.append(((sw - b["sw_out"]) ** 2).flatten(1).mean(1))
-    se, pe, ae = torch.cat(se), torch.cat(pe), torch.cat(ae)
+        pmax = p.flatten(1).amax(1)
+        pmax_true = b["p_out"].flatten(1).amax(1)
+        pred_pen = 30.0 * torch.relu(pmax - 6.0).square()
+        true_pen = 30.0 * torch.relu(pmax_true - 6.0).square()
+        pen_err.append(pred_pen - true_pen)
+    se, pe, ae, pen_err = torch.cat(se), torch.cat(pe), torch.cat(ae), torch.cat(pen_err)
     return {"p_rmse": float(se.sqrt().mean()), "pmax_abs": float(pe.abs().mean()),
-            "pmax_bias": float(pe.mean()), "sw_rmse": float(ae.sqrt().mean())}
+            "pmax_bias": float(pe.mean()), "sw_rmse": float(ae.sqrt().mean()),
+            "penalty_abs": float(pen_err.abs().mean()), "penalty_bias": float(pen_err.mean()),
+            "frac_pen_err_le_2": float((pen_err.abs() <= 2.0).float().mean())}
 
 
 def main():
@@ -129,6 +149,10 @@ def main():
     ap.add_argument("--hi_w", type=float, default=3.0, help="extra weight on high-pressure cells")
     ap.add_argument("--pmax_w", type=float, default=5.0, help="weight of the direct p_max loss term")
     ap.add_argument("--sat_w", type=float, default=0.5)
+    ap.add_argument("--penalty_w", type=float, default=0.0,
+                    help="weight of a smooth log-scaled loss on the actual game penalty")
+    ap.add_argument("--selection_penalty_w", type=float, default=0.0,
+                    help="validation model-selection weight on penalty_abs / pressure cap")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
     if a.backbone in ("gnnlstm", "ccslstm") and a.unroll < 2:
@@ -167,9 +191,10 @@ def main():
             idx = perm[i:i + a.bs]
             if a.unroll == 1:
                 b = {k: v[idx] for k, v in D["train"].items()}
-                loss, *_ = loss_fn(net, b, a.hi_w, a.pmax_w, a.sat_w)
+                loss, *_ = loss_fn(net, b, a.hi_w, a.pmax_w, a.sat_w, a.penalty_w)
             else:
-                loss = loss_unroll(net, D["train"], idx, a.unroll, a.hi_w, a.pmax_w, a.sat_w)
+                loss = loss_unroll(net, D["train"], idx, a.unroll, a.hi_w, a.pmax_w,
+                                   a.sat_w, a.penalty_w)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -177,7 +202,8 @@ def main():
             sched.step()
             run += float(loss) * len(idx)
         v = evaluate(net, D["val"])
-        score = v["p_rmse"] + v["pmax_abs"]           # pressure-relevant selection, not saturation
+        score = (v["p_rmse"] + v["pmax_abs"] +
+                 a.selection_penalty_w * v["penalty_abs"] / P_SCALE)
         if score < best:
             best, best_ep = score, ep
             torch.save({"state_dict": net.state_dict(), "backbone": a.backbone, "width": a.width, "hybrid": a.hybrid, "n_sub": a.n_sub,
@@ -189,6 +215,7 @@ def main():
     blob = torch.load(a.out, map_location=a.device)
     net.load_state_dict(blob["state_dict"])
     res = {"best_epoch": best_ep, "params": n_params, "train_seconds": round(time.time() - t0), "unroll": a.unroll,
+           "selection_score": best, "penalty_w": a.penalty_w,
            "backbone": a.backbone, "hybrid": a.hybrid, "val": evaluate(net, D["val"]), "test": evaluate(net, D["test"])}
     json.dump(res, open(a.out.replace(".pt", "_metrics.json"), "w"), indent=1)
     print("best epoch", best_ep, "| val", res["val"], "\n test", res["test"])

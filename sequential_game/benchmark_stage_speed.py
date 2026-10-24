@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--repeats", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="benchmark only checkpoints whose filename ends in _s<seed>.pt")
     a = ap.parse_args()
 
     torch.set_num_threads(a.threads)
@@ -61,7 +63,13 @@ def main():
         solver_ms.extend(timed(lambda: sim.advance(geo, state, wells), a.repeats))
 
     results = []
-    for path in sorted(glob.glob(os.path.join(a.ckpt_dir, "*.pt"))):
+    checkpoints = sorted(glob.glob(os.path.join(a.ckpt_dir, "*.pt")))
+    if a.seed is not None:
+        suffix = f"_s{a.seed}.pt"
+        checkpoints = [p for p in checkpoints if os.path.basename(p).endswith(suffix)]
+    if not checkpoints:
+        raise FileNotFoundError(f"no checkpoints found in {a.ckpt_dir} for seed={a.seed}")
+    for path in checkpoints:
         blob = torch.load(path, map_location="cpu")
         net = StageNet.from_blob(blob)
         net.load_state_dict(blob["state_dict"])

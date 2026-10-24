@@ -83,7 +83,8 @@ class _Decoder(nn.Module):
         return self.out(self.m2(torch.cat([h, f0], 1)))
 
 
-BACKBONES = ("unet", "ccs", "gnn", "split", "ugnn", "fgnn", "runet", "gnnlstm", "ccslstm", "ccsfno", "fno", "ufno")
+BACKBONES = ("unet", "ccs", "ccsgnn", "gnn", "split", "ugnn", "fgnn",
+             "runet", "gnnlstm", "ccslstm", "ccsfno", "fno", "ufno")
 
 _DIRS = ((0, 1), (0, -1), (1, 0), (-1, 0))        # neighbour offsets (dy, dx) of the 4-neighbour grid graph
 
@@ -170,6 +171,45 @@ class _Split(nn.Module):
 
     def forward(self, x):
         return self.pnet(x)[:, 0], self.snet(x)[0]
+
+
+class _CCSGraphExchange(nn.Module):
+    """CCSNet-style dual decoder with permeability-aware graph exchange.
+
+    A shared multiscale encoder feeds separate pressure and saturation decoders.
+    The first pressure estimate conditions a transmissibility-aware grid GNN, which
+    refines the saturation increment. That increment then feeds a small pressure
+    correction U-Net. The graph and feedback heads start at zero, so initialization
+    is exactly the CCS dual-decoder baseline and the added coupling is learned as a
+    residual. This tests whether explicit cross-field exchange helps beyond CCSNet's
+    separate output decoders without replacing the implicit pressure prior.
+    """
+
+    def __init__(self, in_ch, c):
+        super().__init__()
+        self.e0 = nn.Sequential(_block(in_ch, c), _block(c, c))
+        self.e1 = nn.Sequential(_block(c, c * 2, stride=2), _block(c * 2, c * 2))
+        self.e2 = nn.Sequential(_block(c * 2, c * 4, stride=2), _block(c * 4, c * 4))
+        self.pdec = _Decoder(c, 1)
+        self.sdec = _Decoder(c, 1)
+        self.sgraph = _GridGNN(in_ch + 1, c, n_layers=4, n_out=1)
+        self.pcorr = _UNet(in_ch + 1, c, 1)
+        # Start as the established CCSNet-style shared encoder / dual-decoder model.
+        nn.init.zeros_(self.sgraph.heads[0][-1].weight)
+        nn.init.zeros_(self.sgraph.heads[0][-1].bias)
+        nn.init.zeros_(self.pcorr.dec.out.weight)
+        nn.init.zeros_(self.pcorr.dec.out.bias)
+
+    def forward(self, x):
+        f0 = self.e0(x)
+        f1 = self.e1(f0)
+        f2 = self.e2(f1)
+        dp0 = self.pdec(f0, f1, f2)[:, 0]
+        ds0 = self.sdec(f0, f1, f2)[:, 0]
+        ds_graph = self.sgraph(torch.cat([x, dp0.unsqueeze(1)], dim=1))[0]
+        ds = ds0 + ds_graph
+        dp_corr = self.pcorr(torch.cat([x, ds.unsqueeze(1)], dim=1))[:, 0]
+        return dp0 + dp_corr, ds
 
 
 class _CoupledGrid(nn.Module):
@@ -425,6 +465,8 @@ class StageNet(nn.Module):
                 self.ds = _Decoder(c, 1)
             else:
                 self.dec = _Decoder(c, 2)
+        elif backbone == "ccsgnn":
+            self.core = _CCSGraphExchange(in_ch, c)
         else:
             self.core = _make_core(backbone, in_ch, c)
 
