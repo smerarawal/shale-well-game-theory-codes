@@ -23,9 +23,13 @@ import numpy as np
 from eps_check import open_loop_eps, two_stage_block_eps
 from game3 import Cfg, particle_set_v3, run_episode, schedule_from_log
 from run_study3 import INF, true_geo
-from stage_model import SolverStageModel
+from stage_model_factory import create_stage_model
 
 DEADLINE = [None]
+ENV_MODEL = None
+PLANNER_MODEL = None
+ENV_INFO = None
+PLANNER_INFO = None
 GEOS = range(24, 60)
 BASE = dict(layout="close", horizon=3, cap_total=24.0)
 
@@ -106,18 +110,20 @@ def _work(args):
     try:
         cfg = Cfg(**j["cfg"])
         geo = true_geo(j["geo"], cfg.n)
-        model = SolverStageModel(cfg.stage_time)
+        model = ENV_MODEL
+        planner_model = PLANNER_MODEL
         prior = particle_set_v3(cfg.n, field_seeds=(11, 12, 13, 14))
         seed = 8000 + j["geo"]
         rec = {k: v for k, v in j.items() if k != "cfg"}
         rec.update(cfg={k: ("inf" if isinstance(v, float) and np.isinf(v) else v)
                         for k, v in j["cfg"].items()}, field_seed=int(101 + j["geo"]),
-                   mult=float(geo["mult"]), seed=seed, fluid="water", solver="solver_v3")
+                   mult=float(geo["mult"]), seed=seed, fluid="water", solver="solver_v3",
+                   environment_model=ENV_INFO, planning_model=PLANNER_INFO)
         started = time.time()
         cap_states = trajectories and j["kind"] == "episode"
         summary, log = run_episode(model, cfg, geo, prior, j["mode"], j["info"],
                                    seed=seed, pool_seeds=tuple(range(11, 19)),
-                                   capture_states=cap_states)
+                                   capture_states=cap_states, planning_model=planner_model)
         rec.update(summary)
         if j["kind"] == "two_stage_eps":
             rec["eps"] = two_stage_block_eps(model, cfg, geo, schedule_from_log(log, cfg))
@@ -143,8 +149,18 @@ def _work(args):
         return j["name"], -1
 
 
-def _init(deadline):
+def _init(deadline, environment, planner, checkpoint, device):
+    global ENV_MODEL, PLANNER_MODEL, ENV_INFO, PLANNER_INFO
     DEADLINE[0] = deadline
+    ENV_MODEL, ENV_INFO = create_stage_model(environment, stage_time=1.0,
+                                             checkpoint=checkpoint if environment == "surrogate" else None,
+                                             device=device)
+    if planner == environment:
+        PLANNER_MODEL, PLANNER_INFO = ENV_MODEL, ENV_INFO
+    else:
+        PLANNER_MODEL, PLANNER_INFO = create_stage_model(
+            planner, stage_time=1.0,
+            checkpoint=checkpoint if planner == "surrogate" else None, device=device)
 
 
 def main():
@@ -155,18 +171,26 @@ def main():
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--count_only", action="store_true")
     ap.add_argument("--trajectories", action="store_true", help="save true-state NPZ files for surrogate training")
+    ap.add_argument("--environment", choices=("solver", "surrogate"), default="solver",
+                    help="transition used for the realized reservoir and scored payoffs")
+    ap.add_argument("--planner", choices=("solver", "surrogate"), default="solver",
+                    help="transition used inside belief particles and action valuation")
+    ap.add_argument("--checkpoint", default=None, help="surrogate .pt checkpoint (required if either model is surrogate)")
+    ap.add_argument("--device", default="cpu", help="device for surrogate inference; CPU recommended with multiple workers")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     tiers = a.tiers.replace(",", "").upper()
     jobs = plan(tiers)
     todo = [j for j in jobs if not os.path.exists(os.path.join(a.out, j["name"] + ".json"))]
-    print(f"Study 7: {len(todo)} jobs remaining in tiers {tiers}; geologies 24-59; processes={a.procs}", flush=True)
+    print(f"Study 7: {len(todo)} jobs remaining in tiers {tiers}; geologies 24-59; "
+          f"environment={a.environment}, planner={a.planner}, processes={a.procs}", flush=True)
     if a.count_only:
         return
     start = time.time()
     deadline = start + max(0.0, a.hours) * 3600 if a.hours > 0 else None
     done = 0
-    with Pool(a.procs, initializer=_init, initargs=(deadline,)) as pool:
+    with Pool(a.procs, initializer=_init,
+              initargs=(deadline, a.environment, a.planner, a.checkpoint, a.device)) as pool:
         for result in pool.imap(_work, [(j, a.out, a.trajectories) for j in todo], chunksize=1):
             if result is not None:
                 done += 1

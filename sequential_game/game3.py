@@ -419,14 +419,17 @@ def predictive_diag(belief, obs, wells, cfg):
 
 
 def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None, prefix=None,
-                pool_seeds=(11, 12, 13, 14), capture_states=False):
+                pool_seeds=(11, 12, 13, 14), capture_states=False, planning_model=None):
     """force={t: {op: (rate, drill_flag)}} overrides one operator's action at stage t AFTER planning
     (others keep the planner's action). prefix=[joint,...] replays given joints for the first stages
     instead of planning (used by the one-shot-deviation check)."""
     rng = np.random.default_rng(seed)
+    # `model` advances the realized reservoir. `planning_model` advances belief particles
+    # and candidate actions; defaulting it to `model` preserves all historical runs.
+    planner = model if planning_model is None else planning_model
     geos = [true_geo] if info == "oracle" else prior_geos
     BeliefCls = BeliefV3 if (cfg.belief_mode in ("v3", "v4") and info != "oracle") else Belief
-    belief = BeliefCls(geos, model, cfg, pool_seeds=pool_seeds, seed=seed)
+    belief = BeliefCls(geos, planner, cfg, pool_seeds=pool_seeds, seed=seed)
     true_state = model.initial_state(cfg.n)
     wells = tuple((o,) + tuple(cfg.init_sites[o]) for o in range(cfg.n_ops))
     n_new = [0] * cfg.n_ops
@@ -440,7 +443,7 @@ def run_episode(model, cfg, true_geo, prior_geos, mode, info, seed=0, force=None
         elif mode in ("bau", "static"):
             joint = scripted(cfg, wells, n_new, mode)
         else:
-            joint = choose(model, cfg, belief, wells, prev_rates, n_new, t, mode)
+            joint = choose(planner, cfg, belief, wells, prev_rates, n_new, t, mode)
         if force and t in force:
             joint = list(joint)
             for o, (rate, drill) in force[t].items():
