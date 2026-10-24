@@ -129,3 +129,21 @@ python analyze7.py --dir study7_results
 If Kaggle's CPU allocation differs, first measure runtime with `--hours 0.15 --tiers A --procs 2`. The runner resumes by skipping completed JSON jobs and runs tiers in priority order. An interrupted tier can be incomplete; `analyze7.py` reports paired sample counts and does not fill missing outcomes with zero. `--trajectories` writes compressed `.npz` true-state transitions for episode jobs. Keep those files with the JSON results for later surrogate training.
 
 Tier A is the core H=3 cap-24 versus uncapped comparison plus the H=6 subset. Add B for the capacity sweep, C for rationing, and D for deviation and learning checks. Already-started jobs finish after the deadline; no new job starts once the time budget expires.
+
+## Surrogate inside the game
+
+`stage_model_factory.py` constructs the solver or a checked wrapper around the existing `StageSurrogate` adapter. The game default/reference remains the solver. The provisional checkpoint candidate is GNN + prior2 trained on mixed game/SPE10 episodes, but no checkpoint is stored in this repository; pass its `.pt` path explicitly. The factory checks the declared stage duration and records checkpoint architecture, hybrid, and training-data arguments in each result.
+
+Run a solver-reference game:
+
+```bash
+python run_study7.py --environment solver --planner solver --hours 3.7 --out study7_solver --tiers A,B --procs 4
+```
+
+Run the surrogate as the planner while the solver remains the realized reservoir and payoff reference:
+
+```bash
+python run_study7.py --environment solver --planner surrogate --checkpoint /path/to/gnn_prior2_mixed.pt --device cpu --hours 3.7 --out study7_gnn_prior2 --tiers A,B --procs 4
+```
+
+Set both `--environment` and `--planner` to `surrogate` only for an all-surrogate game rollout. The planner/environment split lets the surrogate affect predicted states and action valuations without replacing the realized solver states or game payoff equations. Compare solver-reference and surrogate-planner outputs on identical geology IDs and seeds. For a fixed-action six-stage comparison before policy integration, use `validate_stage_surrogate.py` with the checkpoint and held-out game/SPE10 evaluation datasets.

@@ -46,7 +46,7 @@ run_one() {
   local -a train
   tag=${bb}_${h}_${data}_s${seed}
   model_unroll=$UNROLL
-  [ "$bb" = gnnlstm ] && model_unroll=$GNNLSTM_UNROLL
+  [[ "$bb" = gnnlstm || "$bb" = ccslstm ]] && model_unroll=$GNNLSTM_UNROLL
   if [ "$data" = game ]; then train=("$OUT/stage_train.npz"); else train=("$OUT/stage_train.npz" "$OUT/spe10_train.npz"); fi
   if [ ! -f "$OUT/${tag}_metrics.json" ]; then
     echo "[start] $tag on $gpu"
@@ -95,7 +95,7 @@ done
 for pid in "${PIDS[@]}"; do wait "$pid" || FAILED=1; done
 
 python summarize_consolidated_sweep.py --dir "$OUT"
-if compgen -G "$OUT/*.pt" > /dev/null; then
+if [ "${RUN_SPEED_BENCHMARK:-1}" = "1" ] && compgen -G "$OUT/*.pt" > /dev/null; then
   # Benchmark all checkpoints so physics hybrid costs are represented as well.
   python benchmark_stage_speed.py --data "$OUT/stage_eval_game.npz" --ckpt_dir "$OUT" \
     --cases "$SPEED_CASES" --out "$OUT/cpu_speed"
