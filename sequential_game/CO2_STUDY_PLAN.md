@@ -10,6 +10,18 @@ The central research question is:
 
 The study should combine the six proposed ideas, with equilibrium-aware data generation as the main surrogate contribution.
 
+## Dimensionality target: build toward 3D
+
+The eventual target is a 3D CO2 game. The current reservoir solver, stage adapter, game state, and SPE10 patch sampler are 2D and square-grid-oriented; they are not a 3D implementation. The existing SPE10 patch path extracts a horizontal x-y layer, so gravity along one of those axes is not the SPE10 vertical direction. Do not describe those current patches as a 3D buoyant-plume experiment.
+
+Use a staged path while keeping the new APIs dimension-aware:
+
+1. **Physics-development case: vertical 2D x-z section.** Fix a y index in SPE10 and retain the x and z coordinates, vertical permeability, porosity, layer order, and physical cell dimensions. This allows buoyant rise and vertical layering at much lower cost than 3D. The two operators then occupy different x positions in the same section; state this limitation because it is not a full separate-lease geometry.
+2. **Coarse 3D validation case.** After the vertical section passes the physical checks, build a small x-y-z model and rerun a few paired arms: cap-24 Nash versus cooperative, a capacity allocation, and a price treatment. Use identical geology, starting state, and action choices wherever possible. The purpose is to see which conclusions survive 3D, not to claim a fully powered 3D study.
+3. **Full 3D game and surrogate.** Expand only after measuring runtime and numerical stability on the coarse 3D case. Make well completions (which layers a well intersects) part of the model specification and, if appropriate, the action space. Train a new 3D surrogate on solver trajectories; the existing 2D GNN+prior2 and CCSNet checkpoints cannot be reused as validated 3D CO2 surrogates.
+
+Do not assume the estimated 15–30x slowdown or study runtime in meeting notes is measured. Benchmark pressure-solve time, transport substeps, and complete planner schedules on the intended hardware before setting sample size. The current SciPy sparse solver is CPU code; two Kaggle T4 GPUs do not automatically accelerate it. A 3D pressure backend and a 3D surrogate are separate engineering tasks.
+
 ## Three geology cohorts
 
 Use three synthetic regimes to test whether geology makes equilibrium computation easier or harder, plus a distinct SPE10 benchmark cohort. Here “suited” means the game’s best-response process is more likely to settle to a stable equilibrium; it does not mean the rock favors the human researcher or one operator.
@@ -17,9 +29,9 @@ Use three synthetic regimes to test whether geology makes equilibrium computatio
 1. **Equilibrium-friendly synthetic cohort:** weaker cross-operator pressure/plume coupling and smoother payoff responses. Best-response iteration is expected to converge consistently from multiple starting action profiles.
 2. **Intermediate synthetic cohort:** moderate heterogeneity and cross-operator coupling between the friendly and challenging regimes. Randomize geology seeds, permeability multipliers, and well layouts within fixed bounds, as in the earlier experiments. This is the middle regime, not a post-hoc selection of geologies whose measured outcomes happen to be halfway between the endpoints.
 3. **Equilibrium-challenging synthetic cohort:** stronger cross-operator coupling, frequently binding pressure/plume constraints, or sharper action-payoff changes. Best-response iteration is expected to be slower, more sensitive to its starting point, or prone to cycling.
-4. **SPE10 benchmark cohort:** Tarbert and Upper Ness property fields as heterogeneity stress tests. SPE10 Model 2 is a synthetic waterflood benchmark, not field-measured CO₂ data. Tarbert is comparatively smooth; Upper Ness is channelized. Run the original property fields as a distinct benchmark after CO₂ physics validation. Describe these as CO₂ simulations on SPE10 rock fields, not as a validated SPE10 CO₂ benchmark. Consider SPE11B as a CO₂-specific benchmark extension; it is a benchmark case, not a real field dataset.
+4. **SPE10 benchmark cohort:** Tarbert and Upper Ness property fields as heterogeneity stress tests. SPE10 Model 2 is a synthetic waterflood benchmark, not field-measured CO₂ data. Tarbert is comparatively smooth; Upper Ness is channelized. For vertical buoyancy work, use a vertical x-z section first and the full 3D volume for the later validation. Keep the existing horizontal-patch CO2 cohort as a separate lateral-heterogeneity debug dataset only. Describe all such runs as CO2 simulations on SPE10 rock properties, not as an official or field-calibrated SPE10 CO2 benchmark. Consider SPE11B as a CO2-specific benchmark extension; it is a benchmark case, not a real field dataset.
 
-To connect the controlled middle regime to SPE10 without obscuring the benchmark, add an optional **SPE10-derived randomized bridge set**: vary field seed/layer band where available, well placement, and bounded permeability multipliers while retaining the SPE10 spatial structure. Report original SPE10 fields and randomized variants separately. Do not blend SPE10 arrays numerically with unrelated synthetic fields unless they are first mapped to a common grid and that transformation is documented.
+To connect the controlled middle regime to SPE10 without obscuring the benchmark, add an optional **SPE10-derived randomized bridge set**: vary vertical slice location or 3D subvolume, well placement/completions, and bounded permeability multipliers while retaining SPE10 spatial structure. Report original SPE10 fields and randomized variants separately. Do not blend SPE10 arrays numerically with unrelated synthetic fields unless they are first mapped to a common grid and that transformation is documented.
 
 Define the synthetic regimes by generation settings and pre-game physical diagnostics, then freeze them before evaluating policy outcomes. The intermediate regime should be specified by parameter ranges between the friendly and challenging generator settings, not by selecting fields after observing convergence. Measure equilibrium behavior separately: iterations to a best-response residual tolerance, convergence rate, cycling/non-convergence, and whether different starting profiles reach different equilibria. This avoids selecting geologies using the very equilibrium results being reported. Also record whether each geology is physically easy or difficult for storage; that is a separate axis from whether the game is easy to solve.
 
@@ -41,9 +53,11 @@ These descriptors support the rule “for this geology class, use this instrumen
 
 The current game adapter injects the wetting water phase. The current transport treatment also uses total-flow direction for saturation upwinding, which cannot reliably represent counter-current buoyant segregation. Changing the phase label or reversing a gravity sign is not sufficient.
 
-**Implementation status:** a separate `co2_solver` stage-model path and phase-specific Darcy-flux option have now been added as a prototype. The existing `solver` path retains its historical behavior. The CO₂ path is not yet validated and must not be used to claim game, equilibrium, or surrogate results until the checks below are completed.
+**Implementation status:** the pushed `co2_solver` path provides phase-specific Darcy-flux plumbing and a brine-filled initial condition. The working tree contains `co2_experiment.py` for randomized synthetic regimes, the existing scaled horizontal SPE10 patch cohort, and a new data-only vertical x-z SPE10 cohort. `spe10_geologies.py` now exposes raw Kx/Ky/Kz in mD with porosity in `[z,y,x]` order; x-z cases retain Kx and Kz separately plus cell spacing and slice metadata. These directional sections are **not consumable by the existing scalar-k game or solver yet**. Optional geometric-mean coarsening is data reduction, not transmissibility-preserving upscaling. The flow prototype still tracks pressure and brine saturation only; it has **not** implemented CO₂ dissolution or residual trapping, the payoff ledger is not yet connected to `game3.py`, and none of this path is physically validated. Do not interpret generated game results until those pieces are integrated and validated.
 
-First specify the model’s scope. A feasible first version is a two-phase, immiscible CO₂–brine model with explicit density contrast, phase-specific relative permeability, gravity, wells, pressure, and saturation. Record which processes are omitted, such as dissolution, capillary trapping, thermal effects, geochemistry, and geomechanics. This is a simplified research model unless those processes are added and calibrated.
+The requested physical scope is a CO₂–brine model with mobile free-phase CO₂, dissolved CO₂ in brine, residual/trapped CO₂, pressure, phase-specific relative permeability, gravity, and phase-aware wells. A consistent state should carry pressure, brine saturation, mobile CO₂ saturation, trapped CO₂ inventory, and dissolved CO₂ concentration (or mass fraction). Define the component inventory in mass units and make dissolution and trapping transfers conservative: dissolution transfers CO₂ from mobile gas to aqueous concentration; residual trapping transfers it from mobile to immobile gas. Trapped CO₂ should not keep contributing gas mobility. A history-dependent trapping relation (for example, a documented Land-type residual-trapping law) and a documented solubility/mass-transfer model are needed.
+
+The first implementation can use a clearly labelled simplified model with constant reference densities/viscosities, a documented solubility relation and finite mass-transfer rate, and a hysteretic residual-trapping rule. It must still conserve the CO₂ component. Thermal effects, geochemistry, geomechanics, and field-calibrated PVT can remain outside scope if stated. Record every constitutive parameter and unit; until calibrated, call outputs normalized/nondimensional research simulations rather than field forecasts.
 
 Before a game run, require these physical checks:
 
@@ -59,7 +73,7 @@ Save diagnostics for every check. If the current solver cannot pass them, use a 
 
 Retain the existing finite-horizon sequential-game structure, but use a separate CO₂ configuration and result namespace. Define decisions, shared constraints, and rewards before sweeping instruments.
 
-Track physical outcomes separately from welfare:
+The selected game objective includes **both** pressure costs and storage/plume value. Track physical outcomes separately from welfare:
 
 - injected and retained CO₂ mass;
 - mobile, residually trapped, and dissolved mass where represented by the model;
@@ -70,6 +84,8 @@ Track physical outcomes separately from welfare:
 State the unit and calibration of stage duration, injection rate, pressure, storage capacity, and monetary payoffs. The current project’s stage-time units are not yet calibrated to years or tonnes, so do not present them as field forecasts until calibrated.
 
 Compare the existing policy instruments where their definitions transfer cleanly (for example, shared cap, fixed allocation, price, and cooperative coordination). Treat a price such as 5–10 as a candidate carried over from the water study, not as a CO₂ result or assumed optimum.
+
+Define an explicit payoff ledger before policy sweeps. The code scaffold in `co2_experiment.py` expresses stage welfare as injection revenue plus a credit for CO₂ retained at the evaluation horizon, less drilling cost, pressure-damage cost, and plume-overlap/containment-risk cost. Count stored CO₂ once: attribute retained mass to its injecting operator with an operator tracer or component ledger, and define how shared plume/pressure damages are allocated to private payoffs. Keep transfers separate from total resource welfare. Normalize or calibrate all terms to compatible units before interpreting the “best” price or welfare gap.
 
 ## Study design
 

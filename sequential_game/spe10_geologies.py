@@ -81,29 +81,45 @@ def _find(data_dir, *names):
     return None
 
 
-def load_spe10(data_dir, phi_floor=0.01):
-    """Returns logK [NZ,NY,NX] (Kx, log10 mD) and phi [NZ,NY,NX].
-    Accepts EITHER spe_perm.dat + spe_phi.dat (SPE web page zip) OR the Eclipse deck files
-    SPE10MODEL2_PERM.INC + SPE10MODEL2_PHI.INC (SPE10_MODEL2 folder of the Eclipse data set).
-    Porosity is floored at phi_floor: the Eclipse deck replaces zero porosities by 1e-7, which would
-    otherwise dominate the per-patch min-max rescaling."""
+def load_spe10_components(data_dir, phi_floor=0.01):
+    """Return raw directional permeability (mD) and porosity in ``[z,y,x]`` order.
+
+    The returned mapping has ``kx_mD``, ``ky_mD``, ``kz_mD``, and ``phi`` arrays.
+    The ``.dat`` format stores the three flattened permeability components in sequence;
+    Eclipse files store them in PERMX/PERMY/PERMZ keyword blocks. This function keeps
+    physical directions and units intact for vertical-section and future 3D solvers.
+    """
     perm_f, phi_f = _find(data_dir, "spe_perm.dat"), _find(data_dir, "spe_phi.dat")
     if perm_f and phi_f:
         perm, phi = _read_flat(perm_f), _read_flat(phi_f)
-        kx = perm[:N_CELLS]
         assert perm.size == 3 * N_CELLS, f"{perm_f} has {perm.size} values, expected {3 * N_CELLS}"
+        kx, ky, kz = (perm[i * N_CELLS:(i + 1) * N_CELLS] for i in range(3))
     else:
         perm_f = _find(data_dir, "SPE10MODEL2_PERM.INC")
         phi_f = _find(data_dir, "SPE10MODEL2_PHI.INC")
         assert perm_f and phi_f, f"no spe_perm.dat/spe_phi.dat and no SPE10MODEL2_PERM.INC/PHI.INC in {data_dir}"
         pa, fa = read_eclipse_arrays(perm_f), read_eclipse_arrays(phi_f)
         print("keywords found:", {k: v.size for k, v in pa.items()}, {k: v.size for k, v in fa.items()})
-        kx = pa.get("PERMX", pa.get("")) if "PERMX" in pa or "" in pa else None
-        assert kx is not None, f"no PERMX block in {perm_f}: found {list(pa)}"
+        kx, ky, kz = (pa.get(key) for key in ("PERMX", "PERMY", "PERMZ"))
+        assert all(v is not None for v in (kx, ky, kz)), f"expected PERMX/PERMY/PERMZ blocks in {perm_f}; found {list(pa)}"
         phi = fa.get("PORO", fa.get("PHI", fa.get("", next(iter(fa.values())))))
-    assert kx.size == N_CELLS, f"Kx has {kx.size} values, expected {N_CELLS}"
-    assert phi.size == N_CELLS, f"porosity has {phi.size} values, expected {N_CELLS}"
-    return np.log10(np.maximum(kx.reshape(NZ, NY, NX), 1e-6)), np.maximum(phi.reshape(NZ, NY, NX), phi_floor)
+    for name, values in (("Kx", kx), ("Ky", ky), ("Kz", kz), ("porosity", phi)):
+        assert values.size == N_CELLS, f"{name} has {values.size} values, expected {N_CELLS}"
+    shape = (NZ, NY, NX)
+    return {"kx_mD": np.maximum(kx.reshape(shape), 1e-6),
+            "ky_mD": np.maximum(ky.reshape(shape), 1e-6),
+            "kz_mD": np.maximum(kz.reshape(shape), 1e-6),
+            "phi": np.maximum(phi.reshape(shape), phi_floor)}
+
+
+def load_spe10(data_dir, phi_floor=0.01):
+    """Returns logK [NZ,NY,NX] (Kx, log10 mD) and phi [NZ,NY,NX].
+    Accepts EITHER spe_perm.dat + spe_phi.dat (SPE web page zip) OR the Eclipse deck files
+    SPE10MODEL2_PERM.INC + SPE10MODEL2_PHI.INC (SPE10_MODEL2 folder of the Eclipse data set).
+    Porosity is floored at phi_floor: the Eclipse deck replaces zero porosities by 1e-7, which would
+    otherwise dominate the per-patch min-max rescaling."""
+    fields = load_spe10_components(data_dir, phi_floor=phi_floor)
+    return np.log10(fields["kx_mD"]), fields["phi"]
 
 
 def _minmax(a):
