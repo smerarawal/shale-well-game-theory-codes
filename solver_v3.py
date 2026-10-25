@@ -128,6 +128,37 @@ def upwind_fractional_flow_faces(Sw, flux_x, flux_y, mu_w=1.0, mu_n=5.0, **corey
     return fw_face_x, fw_face_y
 
 
+def phase_specific_flux_faces(p, k_e, k_n, lamw_e, lamw_n, lamn_e, lamn_n,
+                              dx=1.0, add_gravity=False, rho_w=1.0, rho_n=0.7, g=1.0):
+    """Return wetting/non-wetting Darcy fluxes on east and deeper faces.
+
+    Each phase uses its own mobility and gravity potential. This permits
+    counter-current flow at a vertical face (brine downward while CO2 moves
+    upward), which a single fractional-flow upwind direction cannot express.
+    Boundary faces are no-flow. Positive y flux points toward increasing j
+    (deeper in the current grid convention).
+    """
+    p_east = np.zeros_like(p)
+    p_east[:-1, :] = p[1:, :]
+    p_deeper = np.zeros_like(p)
+    p_deeper[:, :-1] = p[:, 1:]
+    dp_x = (p_east - p) / dx
+    dp_y = (p_deeper - p) / dx
+
+    uw_x = -k_e * lamw_e * dp_x
+    un_x = -k_e * lamn_e * dp_x
+    if add_gravity:
+        uw_y = -k_n * lamw_n * (dp_y - rho_w * g)
+        un_y = -k_n * lamn_n * (dp_y - rho_n * g)
+    else:
+        uw_y = -k_n * lamw_n * dp_y
+        un_y = -k_n * lamn_n * dp_y
+
+    uw_x[-1, :] = 0.0; un_x[-1, :] = 0.0
+    uw_y[:, -1] = 0.0; un_y[:, -1] = 0.0
+    return uw_x, uw_y, un_x, un_y
+
+
 # ---- Part A.4: dual CFL, pressure and saturation are separate limits ----
 
 def max_stable_dt_pressure(k, lambda_total, phi, mu_ref, ct, dx, safety=0.4):
@@ -230,7 +261,8 @@ def solve_two_phase(
     n_pressure_steps=200, pressure_safety=0.4, saturation_safety=0.5,
     save_every=10,
     add_gravity=False, rho_w=1.0, rho_n=0.7, g=1.0,
-    p_init=None, t_end=None, return_time=False,
+    p_init=None, t_end=None, return_time=False, well_modes=None,
+    phase_fluxes=False,
     **corey_kwargs
 ):
     """
@@ -238,6 +270,11 @@ def solve_two_phase(
         True = injects water; False = produces (withdraws local mixture,
         proportional to local fractional flow at that cell).
     Sw_init: defaults to uniform Swc everywhere (pure injection scenario).
+    well_modes: optional per-well values "water_injector", "co2_injector",
+        or "producer"; when omitted the legacy booleans are used.
+    phase_fluxes: use separate phase Darcy fluxes for saturation transport.
+        This enables counter-current buoyancy; default False preserves the
+        historical fractional-flow update.
 
     add_gravity: off by default -- everything below this docstring is
     IDENTICAL to the pre-gravity solver when add_gravity=False (the extra
@@ -264,17 +301,12 @@ def solve_two_phase(
     uniform gravity does not itself create net flow, only internal
     counter-current segregation, which is exactly the correct physics.
 
-    KNOWN SIMPLIFICATION: the saturation update below still upwinds fw
-    using the TOTAL velocity's sign at each face (single upwind direction
-    per face). Under strong buoyancy this can differ from the more
-    rigorous treatment of upwinding each phase's flux independently,
-    which allows true counter-current flow (water down, non-wetting
-    phase up) AT THE SAME FACE even when total velocity there is near
-    zero. This solver cannot represent that counter-current case
-    correctly -- it gets the net migration direction right (validated
-    below) but would understate segregation sharpness in a near-zero-
-    total-velocity, strong-gravity regime. Flagging this rather than
-    quietly shipping it as exact.
+    With the default phase_fluxes=False, saturation uses the historical
+    single total-flow upwind direction, a known simplification under strong
+    buoyancy. Setting phase_fluxes=True instead uses separate phase Darcy
+    fluxes and can represent counter-current flow at a face. That newer path
+    is experimental and still requires its own physical validation before
+    scientific/game results are interpreted.
 
     Assumes dx=1.0 when add_gravity=True (matches every other call site
     in this repo already) -- the gravity terms below are only dimensionally
@@ -303,13 +335,28 @@ def solve_two_phase(
     wj = np.array([loc[1] for loc in well_locations], dtype=int)
     rates = np.asarray(well_rates, dtype=np.float64)
     is_injector = np.asarray(well_is_water_injector, dtype=bool)
+    if well_modes is not None:
+        well_modes = tuple(str(x).lower() for x in well_modes)
+        if len(well_modes) != len(well_locations):
+            raise ValueError("well_modes must have one entry per well")
+        valid_modes = {"water_injector", "brine_injector", "co2_injector", "gas_injector", "producer"}
+        invalid_modes = set(well_modes) - valid_modes
+        if invalid_modes:
+            raise ValueError(f"unsupported well mode(s): {sorted(invalid_modes)}")
 
     pressure_history = []
     saturation_history = []
 
     for step in range(n_pressure_steps):
         lam_total = total_mobility(Sw, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
-        lam_e, lam_w, lam_n, lam_s = face_values_harmonic(lam_total)
+        if phase_fluxes:
+            lam_w_cell, lam_n_cell = phase_mobilities(Sw, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
+            lamw_e, lamw_w, lamw_n, lamw_s = face_values_harmonic(lam_w_cell)
+            lamn_e, lamn_w, lamn_n, lamn_s = face_values_harmonic(lam_n_cell)
+            lam_e, lam_w, lam_n, lam_s = (lamw_e + lamn_e, lamw_w + lamn_w,
+                                           lamw_n + lamn_n, lamw_s + lamn_s)
+        else:
+            lam_e, lam_w, lam_n, lam_s = face_values_harmonic(lam_total)
 
         dt_pressure = max_stable_dt_pressure(k, lam_total, phi, 1.0, ct, dx, safety=pressure_safety)
         if t_end is not None:
@@ -342,23 +389,37 @@ def solve_two_phase(
 
         source_total = np.zeros((nx, ny))
         source_water = np.zeros((nx, ny))
+        source_saturation = source_water
         fw_current = fractional_flow(Sw, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
         for idx in range(len(well_locations)):
             i, j = wi[idx], wj[idx]
-            if is_injector[idx]:
+            mode = well_modes[idx] if well_modes is not None else ("water_injector" if is_injector[idx] else "producer")
+            if mode in ("water_injector", "brine_injector"):
                 source_total[i, j] += rates[idx]
                 source_water[i, j] += rates[idx]
+            elif mode in ("co2_injector", "gas_injector"):
+                source_total[i, j] += rates[idx]
             else:
                 source_total[i, j] -= rates[idx]
                 source_water[i, j] -= rates[idx] * fw_current[i, j]
+
+        if phase_fluxes:
+            # Source correction for the pressure/saturation split: injection
+            # of a non-wetting phase must lower Sw even though its water-phase
+            # source is zero. Producers remove the local mixture, so their
+            # correction cancels consistently with the local fractional flow.
+            source_saturation = source_water - fw_current * source_total
 
         if add_gravity:
             # phase-specific mobilities, face-averaged the SAME way (harmonic
             # mean) as lambda_total already is -- only the north/south (j-axis
             # = depth) faces matter, gravity has no x-component here
-            lam_w_cell, lam_n_cell = phase_mobilities(Sw, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
-            _, _, lamw_n_face, _ = face_values_harmonic(lam_w_cell)
-            _, _, lamn_n_face, _ = face_values_harmonic(lam_n_cell)
+            if phase_fluxes:
+                lamw_n_face, lamn_n_face = lamw_n, lamn_n
+            else:
+                lam_w_cell, lam_n_cell = phase_mobilities(Sw, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
+                _, _, lamw_n_face, _ = face_values_harmonic(lam_w_cell)
+                _, _, lamn_n_face, _ = face_values_harmonic(lam_n_cell)
             # Q_face[i,j]: gravity-driven Darcy velocity across the face
             # between (i,j) and (i,j+1), positive = flow toward +j (deeper).
             # At dx=1 this is simultaneously a valid velocity term (added to
@@ -377,27 +438,44 @@ def solve_two_phase(
 
         p_e2 = np.zeros_like(p); p_e2[:-1, :] = p[1:, :]
         p_n2 = np.zeros_like(p); p_n2[:, :-1] = p[:, 1:]
-        vel_x = -k_e * lam_e * (p_e2 - p) / dx
-        vel_y = -k_n * lam_n * (p_n2 - p) / dx
-        if add_gravity:
-            vel_y = vel_y + Q_face
+        if phase_fluxes:
+            water_flux_x, water_flux_y, co2_flux_x, co2_flux_y = phase_specific_flux_faces(
+                p, k_e, k_n, lamw_e, lamw_n, lamn_e, lamn_n, dx=dx,
+                add_gravity=add_gravity, rho_w=rho_w, rho_n=rho_n, g=g)
+            vel_x, vel_y = water_flux_x + co2_flux_x, water_flux_y + co2_flux_y
+        else:
+            vel_x = -k_e * lam_e * (p_e2 - p) / dx
+            vel_y = -k_n * lam_n * (p_n2 - p) / dx
+            if add_gravity:
+                vel_y = vel_y + Q_face
 
-        dt_sat_max = max_stable_dt_saturation(Sw, vel_x, vel_y, phi, dx, mu_w=mu_w, mu_n=mu_n,
-                                               safety=saturation_safety, **corey_kwargs)
+        if phase_fluxes:
+            water_flux_w = np.zeros_like(water_flux_x); water_flux_w[1:, :] = water_flux_x[:-1, :]
+            water_flux_s = np.zeros_like(water_flux_y); water_flux_s[:, 1:] = water_flux_y[:, :-1]
+            max_cell_outflow = np.max(np.abs(water_flux_x) + np.abs(water_flux_w)
+                                      + np.abs(water_flux_y) + np.abs(water_flux_s)) / dx
+            max_cell_source = np.max(np.abs(source_saturation))
+            dt_sat_max = saturation_safety * np.min(phi) / (max_cell_outflow + max_cell_source + 1e-12)
+        else:
+            dt_sat_max = max_stable_dt_saturation(Sw, vel_x, vel_y, phi, dx, mu_w=mu_w, mu_n=mu_n,
+                                                   safety=saturation_safety, **corey_kwargs)
         n_sat_substeps = max(1, int(np.ceil(dt_pressure / dt_sat_max)))
         dt_sub = dt_pressure / n_sat_substeps
 
         for _ in range(n_sat_substeps):
-            fw_face_x, fw_face_y = upwind_fractional_flow_faces(Sw, vel_x, vel_y, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
-
-            sat_flux_e = fw_face_x * vel_x
-            sat_flux_n = fw_face_y * vel_y
+            if phase_fluxes:
+                sat_flux_e, sat_flux_n = water_flux_x, water_flux_y
+            else:
+                fw_face_x, fw_face_y = upwind_fractional_flow_faces(
+                    Sw, vel_x, vel_y, mu_w=mu_w, mu_n=mu_n, **corey_kwargs)
+                sat_flux_e = fw_face_x * vel_x
+                sat_flux_n = fw_face_y * vel_y
             sat_flux_w = np.zeros_like(sat_flux_e); sat_flux_w[1:, :] = sat_flux_e[:-1, :]
             sat_flux_s = np.zeros_like(sat_flux_n); sat_flux_s[:, 1:] = sat_flux_n[:, :-1]
 
             div_sat_flux = (sat_flux_e - sat_flux_w + sat_flux_n - sat_flux_s) / dx
 
-            Sw_raw = Sw + dt_sub / phi * (-div_sat_flux + source_water)
+            Sw_raw = Sw + dt_sub / phi * (-div_sat_flux + source_saturation)
             Sw = conservative_clip(Sw_raw, phi, Swc, Sor)
 
         if step % save_every == 0:
