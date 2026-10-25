@@ -62,7 +62,7 @@ class CheckedStageModel:
 
 
 def create_stage_model(kind="solver", stage_time=1.0, checkpoint=None, device="cpu"):
-    """Return `(checked_model, metadata)` for `solver` or `surrogate`.
+    """Return `(checked_model, metadata)` for water solver, CO2 solver, or surrogate.
 
     Surrogate checkpoints must use the same stage duration as the game. All physical
     arrays cross the boundary in solver units; StageSurrogate performs its documented
@@ -75,8 +75,17 @@ def create_stage_model(kind="solver", stage_time=1.0, checkpoint=None, device="c
         impl = SolverStageModel(stage_time=stage_time)
         info = {"backend": "solver", "stage_time": stage_time, "checkpoint": None}
         return CheckedStageModel(impl, "solver", info), info
+    if kind == "co2_solver":
+        from co2_stage_model import CO2BrineStageModel
+
+        impl = CO2BrineStageModel(stage_time=stage_time)
+        info = {"backend": "solver", "fluid": "co2_brine_immiscible",
+                "stage_time": stage_time, "checkpoint": None,
+                "phase_fluxes": True, "gravity": impl.gravity,
+                "rho_brine": impl.rho_brine, "rho_co2": impl.rho_co2}
+        return CheckedStageModel(impl, "co2_solver", info), info
     if kind != "surrogate":
-        raise ValueError("kind must be 'solver' or 'surrogate'")
+        raise ValueError("kind must be 'solver', 'co2_solver', or 'surrogate'")
     if not checkpoint:
         raise ValueError("surrogate backend requires --checkpoint pointing to a trained .pt file")
     path = Path(checkpoint).expanduser().resolve()
