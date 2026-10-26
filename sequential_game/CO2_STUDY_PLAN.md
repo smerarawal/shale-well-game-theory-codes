@@ -31,6 +31,16 @@ Use three synthetic regimes to test whether geology makes equilibrium computatio
 3. **Equilibrium-challenging synthetic cohort:** stronger cross-operator coupling, frequently binding pressure/plume constraints, or sharper action-payoff changes. Best-response iteration is expected to be slower, more sensitive to its starting point, or prone to cycling.
 4. **SPE10 benchmark cohort:** Tarbert and Upper Ness property fields as heterogeneity stress tests. SPE10 Model 2 is a synthetic waterflood benchmark, not field-measured CO₂ data. Tarbert is comparatively smooth; Upper Ness is channelized. For vertical buoyancy work, use a vertical x-z section first and the full 3D volume for the later validation. Keep the existing horizontal-patch CO2 cohort as a separate lateral-heterogeneity debug dataset only. Describe all such runs as CO2 simulations on SPE10 rock properties, not as an official or field-calibrated SPE10 CO2 benchmark. Consider SPE11B as a CO2-specific benchmark extension; it is a benchmark case, not a real field dataset.
 
+### Geology-input visualization and descriptive analysis
+
+After generating the NPZ and manifest, create figures and cohort summaries with:
+
+```bash
+python sequential_game/visualize_co2_geologies.py --input-dir /path/to/co2_geologies
+```
+
+The script writes six-sample synthetic-regime panels, separate SPE10 horizontal-patch and vertical-section figures, descriptor-distribution figures split by normalized inputs versus raw SPE10 x-z sections, and a cohort-level descriptor CSV under `figures/`. Synthetic maps share color scales across the three regimes. Horizontal SPE10 patches are explicitly labeled as per-patch normalized inputs; they are not raw-contrast comparisons. Vertical SPE10 plots retain separate Kx/Kz and porosity, use log10(mD) for permeability, and use physical x/z coordinates with the SPE10 cell spacing. The descriptor plots summarize input properties before flow and keep the normalized and raw-K scales apart. They cannot validate that friendly/intermediate/challenging cases actually produce the intended interference or equilibrium difficulty; that requires solver-derived measurements.
+
 To connect the controlled middle regime to SPE10 without obscuring the benchmark, add an optional **SPE10-derived randomized bridge set**: vary vertical slice location or 3D subvolume, well placement/completions, and bounded permeability multipliers while retaining SPE10 spatial structure. Report original SPE10 fields and randomized variants separately. Do not blend SPE10 arrays numerically with unrelated synthetic fields unless they are first mapped to a common grid and that transformation is documented.
 
 Define the synthetic regimes by generation settings and pre-game physical diagnostics, then freeze them before evaluating policy outcomes. The intermediate regime should be specified by parameter ranges between the friendly and challenging generator settings, not by selecting fields after observing convergence. Measure equilibrium behavior separately: iterations to a best-response residual tolerance, convergence rate, cycling/non-convergence, and whether different starting profiles reach different equilibria. This avoids selecting geologies using the very equilibrium results being reported. Also record whether each geology is physically easy or difficult for storage; that is a separate axis from whether the game is easy to solve.
@@ -125,6 +135,46 @@ After the simulator is validated, first differentiate through a pressure/surroga
 ### F. Policy distillation
 
 After stable policies are available, distill Nash and cooperative choices into small decision trees or rules based on stage, remaining permit, pressure, and plume indicators. Test rules such as “inject at the high rate until a pressure/plume threshold, then taper” on held-out geology seeds using the solver. Report the welfare retained and safety violations relative to the full policy.
+
+## Surrogate architecture plan for CO₂
+
+### Architecture candidates to recompute for CO₂
+
+The previously shared architecture comparison is an **initial screen on one randomized synthetic source**. Its L2-style scores were used to identify candidates, not as results on the new friendly/intermediate/challenging cohorts, SPE10, or CO₂ physics. Do not present or copy those values into the CO₂ results. Recompute every reported architecture metric on the CO₂ solver's held-out geology sets before drawing conclusions.
+
+Use these as candidates for the new experiment, not as pre-ranked CO₂ winners:
+
+- **Core field-model candidates:** CCSNet, U-Net baseline, U-FNO, trajectory-trained ResUNet, and plain FNO.
+- **Game-specific carry-over candidate:** GNN + prior2, because it performed well in the separate six-stage brine game. This is a different task and is included to test transfer of the game-oriented design, not as a CO₂ performance claim. The earlier CPU speedup was measured on the old 2D setup and must be remeasured.
+- **One exploratory architecture hybrid:** CCSNet + ConvLSTM trajectory memory, to test whether recurrent state helps a multi-stage game. Do not create every pairwise backbone combination.
+- **Defer from the first CO₂ screen:** DeepONet, E2C, DeepONet-KAN, FINN, GNS, nested FNO, and physics-informed ConvLSTM/FNO variants. Their initial single-source screen does not justify spending the first CO₂ budget on them. `GNS` is also not the same implementation as the earlier game-specific `GNN + prior2` candidate.
+
+The existing local repository defines 13 different **2D stage-surrogate** backbones. The previous architecture list has 16 models, while the separate whole-trajectory screen supplied here has 15 rows. These inventories are not interchangeable; this CO₂ plan uses the candidate names above and requires their appropriate 3D or x-z implementations before training.
+
+### Staged comparison and physics hybrids
+
+Do not start this comparison until the CO₂ solver, trajectory dataset, 3D/x-z model inputs, and physical priors refer to the same state variables and pass the Gate 1 checks. The existing architecture code and `prior`/`prior2` currently operate on 2D pressure and brine saturation; they are not drop-in CO₂/3D models.
+
+1. **Pilot architecture screen:** on identical train/validation/test geology splits, train the five field-model candidates plus GNN+prior2 and the optional CCSNet-ConvLSTM candidate. Use one seed to screen, not to declare a winner. Start with a common mixed training set spanning friendly, intermediate, challenging synthetic cases and a defined SPE10 training subset. Hold out entire geology seeds, vertical slices, and original SPE10 regions as appropriate.
+2. **Prior ablation:** compare `none`, `prior`, and `prior2` on CCSNet, U-Net, and GNN. Compare `none` and `prior2` on the remaining screen candidates. This tests the value of a CO₂-specific differentiable pressure solve without multiplying every backbone by every hybrid. `prior` must use current phase mobilities; `prior2` must recompute pressure using the predicted mobile saturation path. Both must include anisotropic K, vertical gravity, well sources, and the same pressure equation as the validated simulator.
+3. **Confirmatory run:** take the best two or three candidates by held-out geology-level decision regret and physical safety metrics, then train at least three seeds each. Preserve seed-level results and report mean, standard deviation, and geology-bootstrap confidence intervals. Include a solver-only reference. Benchmark inference and planning time against the same 3D solver on the same hardware; the old 4.3x result is not a 3D speed claim.
+4. **Trajectory/game validation:** score both teacher-forced one-step transitions and autoregressive multi-stage rollouts. Evaluate the actual planner actions using solver rollouts, so a small field error cannot conceal a poor action ranking or a pressure/plume violation.
+
+The requested earlier comparison refers to 16 individual architectures, while the supplied whole-trajectory table contains 15 ranked rows and the current local `stage_surrogate.py` defines 13 different 2D backbones. Keep these experiment inventories separate. Use the five evidence-backed trajectory models above plus the prior GNN game candidate for the first CO₂ screen; do not claim this reproduces either previous 16-model experiment.
+
+### Required CO₂ error analysis
+
+Report each metric per geology and per stage, including the final autoregressive stage. Preserve the same test cases across architectures and seeds.
+
+| Error family | Required measures |
+|---|---|
+| Pressure field | RMSE, MAE, max-absolute error, R²; p_max absolute error, signed bias and high percentile; top-decile-pressure RMSE; well-cell RMSE |
+| Phase fields | Brine and mobile-CO₂ saturation RMSE/MAE/max error; plume footprint IoU/F1 at declared saturation cutoffs; plume area/volume and front displacement |
+| CO₂ accounting | Dissolved, mobile, and residual-trapped mass absolute/relative error; total component mass-balance residual; retained-mass error |
+| Safety/payoff | Pressure-cap violation classification and rate; error in the pressure penalty `30 × max(0, p_max − 6)^2` if that cap and calibration are retained; plume overlap and boundary-contact error; payoff error and solver-measured action regret |
+| Robustness and cost | Metrics by friendly/intermediate/challenging, rough/smooth, Tarbert/Ness, more-well and unseen-slice sets; stage-wise error growth; parameters, peak memory, train time, batch-1 inference time and full planner runtime |
+
+The pressure penalty above is inherited from the current game experiment, not yet calibrated for CO₂. The CO₂ payoff also includes retained storage and plume/containment terms, so report errors in each payoff component and total welfare separately. The supplied five-model OOD p_max range and negative SPE10 bias make pressure-tail, well-cell, and p_max-bias analysis mandatory, not optional.
 
 ## Result and artifact requirements
 

@@ -1,5 +1,7 @@
 # Consolidated surrogate experiment
 
+This document describes the repository's existing **2D brine stage-transition** models and sweeps. The separate CCSNet/U-Net/U-FNO/trajectory-ResUNet/FNO architecture screen was run on one randomized synthetic source; it is only a candidate-selection screen for recomputation on new CO₂ geologies. It is not a CO₂ result and is not implemented as a CO₂/3D training pipeline. The CO₂ shortlist and error protocol are in `CO2_STUDY_PLAN.md`. Do not combine the two experiment scores into one ranking.
+
 `run_consolidated_sweep.sh` evaluates the original six U-Net cells (`none`, `prior`, `prior2` × `game`, `mix`) alongside the same hybrid/data matrix for the architecture baselines and new coupled models. The default is one seed, 10 architectures × 3 hybrid modes × 2 training-data conditions (60 runs), dispatched two at a time to Kaggle's T4x2 GPUs. Set `BACKBONES`, `HYBRIDS`, `DATASETS`, `SEEDS`, or `EPOCHS` to reduce or extend the sweep. The `mix` condition concatenates the game's training fields with SPE10 train-band patches. Tarbert and Upper Ness test-band patches remain held out for evaluation.
 
 ## Architecture choices
