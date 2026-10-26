@@ -325,16 +325,30 @@ class CO2XZSolver:
 
             # Pressure is implicit; redo with a smaller dt if explicit phase
             # transport would violate its cellwise CFL bound.
-            for _ in range(8):
+            stable = dt
+            cfl_converged = False
+            # Pressure depends on dt through accumulation, so the transport
+            # CFL bound is a fixed-point condition rather than a one-shot
+            # estimate. Heterogeneous SPE10 fields can need more than a few
+            # backtracks before that condition settles.
+            for _ in range(64):
                 p_new = self._pressure(st["p_pa"], poro, txw, txg, tzw, tzg,
                                        qwell, dt, gravity_sign)
                 qxw, qzw, qxg, qzg = self._phase_fluxes(p_new, kx, kz, lamw, lamg, gravity_sign)
                 stable = self._stable_dt(poro, sg_mob, sg_trap, qxw, qzw, qxg, qzg, wells)
                 if stable >= dt * (1 - 1e-10):
+                    cfl_converged = True
                     break
-                dt = min(dt, stable)
-            else:
-                raise RuntimeError("could not satisfy CO2 transport CFL bound")
+                next_dt = min(dt, stable)
+                if next_dt >= dt * (1 - 1e-14):
+                    break
+                dt = next_dt
+            if not cfl_converged:
+                raise RuntimeError(
+                    "could not satisfy CO2 transport CFL bound after 64 pressure/transport iterations "
+                    f"(trial dt={dt:.6g} s, latest stable dt={stable:.6g} s, "
+                    f"minimum configured timestep=1e-6 s); check injection rate, grid units, "
+                    "and whether a cell is at its saturation limit")
 
             old_mass = self.component_masses(st, poro)["total_co2_kg"]
             pv = poro * self.cell_volume
