@@ -63,7 +63,25 @@ These descriptors support the rule “for this geology class, use this instrumen
 
 The current game adapter injects the wetting water phase. The current transport treatment also uses total-flow direction for saturation upwinding, which cannot reliably represent counter-current buoyant segregation. Changing the phase label or reversing a gravity sign is not sufficient.
 
-**Implementation status:** the pushed `co2_solver` path provides phase-specific Darcy-flux plumbing and a brine-filled initial condition. The working tree contains `co2_experiment.py` for randomized synthetic regimes, the existing scaled horizontal SPE10 patch cohort, and a new data-only vertical x-z SPE10 cohort. `spe10_geologies.py` now exposes raw Kx/Ky/Kz in mD with porosity in `[z,y,x]` order; x-z cases retain Kx and Kz separately plus cell spacing and slice metadata. These directional sections are **not consumable by the existing scalar-k game or solver yet**. Optional geometric-mean coarsening is data reduction, not transmissibility-preserving upscaling. The flow prototype still tracks pressure and brine saturation only; it has **not** implemented CO₂ dissolution or residual trapping, the payoff ledger is not yet connected to `game3.py`, and none of this path is physically validated. Do not interpret generated game results until those pieces are integrated and validated.
+**Implementation status:** `co2_stage_model.py` remains an older experimental adapter to the scalar-k brine solver and is not the CO₂ training path. A separate `co2_xz_solver.py` now provides an experimental anisotropic vertical x-z IMPES pilot with Kx/Kz, phase-potential upwind fluxes, mobile/trapped gas, aqueous dissolved CO₂, finite-rate local dissolution, and simplified hysteretic trapping. `generate_co2_xz_pilot.py` creates solver-labelled transition pairs from the raw SPE10 vertical-section arrays. These are research prototypes, not field-calibrated or fully validated physics: densities/viscosities are constant, capillary pressure and production wells are absent, and the pressure accumulation is an IMPES approximation. The old scalar-k game and `prior`/`prior2` models still cannot consume directional x-z sections. Optional geometric-mean coarsening is data reduction, not transmissibility-preserving upscaling. The payoff ledger is not connected to `game3.py`, and the pilot is not a final training/evaluation set.
+
+The new invariant checks pass on small uniform synthetic grids for: no-gravity no-drift, gravity-direction reversal, timestep-refined buoyancy trend, positive injection pressure response, bounded saturations, CO₂ component mass closure, local dissolution, and residual trapping. This validates those code paths only on the tested grids and parameter choices; it does not establish SPE10 convergence, grid convergence, phase-by-phase brine mass closure, or field accuracy. The pilot writer was smoke-checked with a small synthetic archive, but real SPE10 trajectories must be generated in Kaggle from the user's saved `co2_geology_cohorts.npz`.
+
+For the first pilot, use two SPE10 slices from each region, symmetric and alternating two-operator rates, and three 30-day stages. A modest 2× x/z coarsening can keep the first CPU run small; label it as exploratory because geometric-mean coarsening is not a flow-preserving upscaling. It writes separate Tarbert and Upper Ness transition NPZs plus stage diagnostics and parameter metadata. This is enough to inspect solver outputs and rough runtime, not enough to train or claim a generalizing surrogate. Before training, run a larger paired label-generation set, split by geology seed, add physical-scale synthetic x-z geologies, and hold out entire geology slices/seeds.
+
+Kaggle commands, after the geology-preparation cell has created `/kaggle/working/co2_geologies/co2_geology_cohorts.npz`:
+
+```bash
+!git -C /kaggle/working/surrogate_repo pull origin codex/ccs-lstm-fno-variants
+!python /kaggle/working/surrogate_repo/sequential_game/test_co2_xz_solver.py
+!python /kaggle/working/surrogate_repo/sequential_game/generate_co2_xz_pilot.py \
+  --input-dir /kaggle/working/co2_geologies \
+  --out-dir /kaggle/working/co2_xz_pilot \
+  --geologies-per-region 2 --stages 3 --stage-days 30 \
+  --coarsen-x 2 --coarsen-z 2
+```
+
+The solver is CPU/SciPy sparse code; Kaggle GPU acceleration is not used by this pilot. Inspect `pilot_stage_metrics.csv` for mass residuals, pressure, plume, and runtime before expanding the label budget.
 
 The requested physical scope is a CO₂–brine model with mobile free-phase CO₂, dissolved CO₂ in brine, residual/trapped CO₂, pressure, phase-specific relative permeability, gravity, and phase-aware wells. A consistent state should carry pressure, brine saturation, mobile CO₂ saturation, trapped CO₂ inventory, and dissolved CO₂ concentration (or mass fraction). Define the component inventory in mass units and make dissolution and trapping transfers conservative: dissolution transfers CO₂ from mobile gas to aqueous concentration; residual trapping transfers it from mobile to immobile gas. Trapped CO₂ should not keep contributing gas mobility. A history-dependent trapping relation (for example, a documented Land-type residual-trapping law) and a documented solubility/mass-transfer model are needed.
 
