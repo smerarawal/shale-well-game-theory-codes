@@ -201,8 +201,8 @@ def _write_descriptor_summary(manifest_path, out_dir):
         names = list(dict.fromkeys(r["cohort"] for r in subset))
         fig, axes = plt.subplots(1, 3, figsize=(max(11, 2.2 * len(names)), 4), constrained_layout=True)
         for ax, metric, title in zip(axes,
-                ("logk_std", "high_k_fraction", "largest_high_k_component_fraction"),
-                ("standard deviation of log K", "fraction above 80th-percentile K", "largest high-K component / cells")):
+                ("logk_std", "phi_std", "largest_high_k_component_fraction"),
+                ("standard deviation of log K", "porosity standard deviation", "largest high-K component / cells")):
             data = [[float(r[metric]) for r in subset if r.get("cohort") == name and r.get(metric)]
                     for name in names]
             ax.boxplot(data, labels=names, showmeans=True)
