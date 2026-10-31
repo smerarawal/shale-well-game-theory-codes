@@ -63,7 +63,9 @@ def make_regime_geology(seed, n=12, regime="intermediate", mult=None):
     center = n // 2 + int(rng.integers(-max(1, n // 12), max(2, n // 12 + 1)))
     if regime == "friendly":
         width = max(1, n // 12)
-        k[max(0, center - width):min(n, center + width + 1), :] *= spec.barrier_strength
+        # Operators are separated along x, so the weak-permeability barrier
+        # must be a vertical band in the [z, x] array.
+        k[:, max(0, center - width):min(n, center + width + 1)] *= spec.barrier_strength
     elif regime == "challenging":
         # A gently meandering, randomized band connects the two operator zones.
         width = max(1, n // 10)
@@ -161,12 +163,17 @@ def generate_spe10_xz_cohort(data_dir, n_per_region=24, seed=82000,
     fields = load_spe10_components(str(data_dir), phi_floor=0.0)
     result = {}
     bands = (("tarbert", TARBERT), ("upper_ness", UPPER_NESS))
+    if n_per_region > fields["phi"].shape[1]:
+        raise ValueError("n_per_region cannot exceed the number of SPE10 y slices when sampling without replacement")
+    # Use matched, unique y slices for Tarbert and Upper Ness. This prevents
+    # duplicate sections and supports geology-level holdouts across both bands.
+    y_indices = np.random.default_rng(seed).choice(fields["phi"].shape[1],
+                                                    size=n_per_region, replace=False)
     for ri, (name, layers) in enumerate(bands):
-        rng = np.random.default_rng(seed + ri)
         cases = []
         z0, z1 = min(layers), max(layers) + 1
         for i in range(n_per_region):
-            y = int(rng.integers(0, fields["phi"].shape[1]))
+            y = int(y_indices[i])
             mult = float(permeability_multipliers[i % len(permeability_multipliers)])
             arrays = {}
             for key in ("kx_mD", "kz_mD"):
