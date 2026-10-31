@@ -165,10 +165,21 @@ def generate_spe10_xz_cohort(data_dir, n_per_region=24, seed=82000,
     bands = (("tarbert", TARBERT), ("upper_ness", UPPER_NESS))
     if n_per_region > fields["phi"].shape[1]:
         raise ValueError("n_per_region cannot exceed the number of SPE10 y slices when sampling without replacement")
-    # Use matched, unique y slices for Tarbert and Upper Ness. This prevents
-    # duplicate sections and supports geology-level holdouts across both bands.
-    y_indices = np.random.default_rng(seed).choice(fields["phi"].shape[1],
-                                                    size=n_per_region, replace=False)
+    # Use matched, unique y slices for Tarbert and Upper Ness. Reserve spatial
+    # y blocks for train/validation/test so adjacent sections cannot leak across
+    # random splits. SPE10 has 220 y rows; train uses both outer blocks while
+    # validation and test are separate interior blocks.
+    n_train = int(round(2 * n_per_region / 3))
+    n_val = int(round(n_per_region / 6))
+    n_test = n_per_region - n_train - n_val
+    pools = (np.r_[0:73, 147:220], np.arange(73, 110), np.arange(110, 147))
+    counts = (n_train, n_val, n_test)
+    if any(count > len(pool) for count, pool in zip(counts, pools)):
+        raise ValueError("requested SPE10 sample count exceeds a spatial y-block capacity")
+    rng = np.random.default_rng(seed)
+    y_indices = np.concatenate([rng.choice(pool, size=count, replace=False)
+                                for pool, count in zip(pools, counts)])
+    rng.shuffle(y_indices)
     for ri, (name, layers) in enumerate(bands):
         cases = []
         z0, z1 = min(layers), max(layers) + 1

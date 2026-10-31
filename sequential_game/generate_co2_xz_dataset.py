@@ -56,9 +56,22 @@ def _resample(a, target_z, target_x, *, geometric=False):
 
 def _split_geologies(cases, *, spe10, seed):
     """Return index lists, keeping all matching y sections in one split."""
+    if spe10:
+        result = {name: [] for name in SPLITS}
+        for i, case in enumerate(cases):
+            y = int(case["metadata"]["spe10_y_index"])
+            if y < 73 or y >= 147:
+                result["train"].append(i)
+            elif y < 110:
+                result["validation"].append(i)
+            else:
+                result["test"].append(i)
+        if any(not result[name] for name in SPLITS):
+            raise ValueError("SPE10 archive must include sampled y-slices from all three spatial split blocks")
+        return result
     groups = {}
     for i, case in enumerate(cases):
-        group = int(case["metadata"].get("spe10_y_index", case["seed"])) if spe10 else int(case["seed"])
+        group = int(case["seed"])
         groups.setdefault(group, []).append(i)
     group_ids = np.asarray(sorted(groups), dtype=np.int64)
     if len(group_ids) < 3:
@@ -167,7 +180,8 @@ def _build_cases(npz, target_n):
 
 
 def _generate_split(cases, indices, cohort, split, args, schedule_seed):
-    state_fields = ("p_pa", "sg_mobile", "sg_trapped", "c_dissolved_kg_m3")
+    # sg_max is required to make the Land-style hysteresis state Markov.
+    state_fields = ("p_pa", "sg_mobile", "sg_trapped", "sg_max", "c_dissolved_kg_m3")
     states = {f"{key}_{edge}": [] for key in state_fields for edge in ("in", "out")}
     states.update({key: [] for key in ("kx_mD", "kz_mD", "phi")})
     labels = {key: [] for key in (
@@ -300,6 +314,7 @@ def main():
     config = {"description": "CO2 x-z solver labels; exploratory physical/scaling assumptions",
               "parameters": vars(args),
               "cohorts": list(COHORTS),
+              "dynamic_state_fields": ["p_pa", "sg_mobile", "sg_trapped", "sg_max", "c_dissolved_kg_m3"],
               "split_unit": "synthetic geology seed; SPE10 y slice",
               "transitions": len(all_metrics),
               "synthetic_scaling": "rank-map scalar synthetic k to pooled SPE10 directional Kx/Kz marginals; fixed 1200 ft x 100 ft domain",
