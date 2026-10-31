@@ -65,16 +65,32 @@ The current game adapter injects the wetting water phase. The current transport 
 
 **Implementation status:** `co2_stage_model.py` remains an older experimental adapter to the scalar-k brine solver and is not the CO₂ training path. A separate `co2_xz_solver.py` now provides an experimental anisotropic vertical x-z IMPES pilot with Kx/Kz, phase-potential upwind fluxes, mobile/trapped gas, aqueous dissolved CO₂, finite-rate local dissolution, and simplified hysteretic trapping. `generate_co2_xz_pilot.py` creates solver-labelled transition pairs from the raw SPE10 vertical-section arrays. These are research prototypes, not field-calibrated or fully validated physics: densities/viscosities are constant, capillary pressure and production wells are absent, and the pressure accumulation is an IMPES approximation. The old scalar-k game and `prior`/`prior2` models still cannot consume directional x-z sections. Optional geometric-mean coarsening is data reduction, not transmissibility-preserving upscaling. The payoff ledger is not connected to `game3.py`, and the pilot is not a final training/evaluation set.
 
-The new invariant checks pass on small uniform synthetic grids for: no-gravity no-drift, gravity-direction reversal, timestep-refined buoyancy trend, positive injection pressure response, bounded saturations, CO₂ component mass closure, local dissolution, and residual trapping. This validates those code paths only on the tested grids and parameter choices; it does not establish SPE10 convergence, grid convergence, phase-by-phase brine mass closure, or field accuracy. The pilot writer was smoke-checked with a small synthetic archive, but real SPE10 trajectories must be generated in Kaggle from the user's saved `co2_geology_cohorts.npz`.
+The invariant checks pass on small uniform grids for: no-gravity no-drift, gravity-direction reversal, timestep-refined buoyancy trend, positive injection pressure response, bounded saturations, CO₂ component mass closure, local dissolution, and residual trapping. A 24-transition SPE10 pilot also completed with a largest relative CO₂ mass-balance residual of approximately `2.9e-14`; it had 12 transitions each for Tarbert and Upper Ness, no duplicate geology/schedule/stage rows, and peak mobile saturation below 0.083. This validates only the tested code paths and pilot conditions. It does not establish SPE10 convergence, grid convergence, phase-by-phase brine mass closure, or field accuracy.
 
-For the first pilot, use two SPE10 slices from each region, symmetric and alternating two-operator rates, and three 30-day stages. A modest 2× x/z coarsening can keep the first CPU run small; label it as exploratory because geometric-mean coarsening is not a flow-preserving upscaling. It writes separate Tarbert and Upper Ness transition NPZs plus stage diagnostics and parameter metadata. This is enough to inspect solver outputs and rough runtime, not enough to train or claim a generalizing surrogate. Before training, run a larger paired label-generation set, split by geology seed, add physical-scale synthetic x-z geologies, and hold out entire geology slices/seeds.
+Before surrogate training, regenerate the geology archive with the current `co2_experiment.py`: the friendly synthetic barrier is now placed between wells along x, and SPE10 Tarbert/Ness sections use the same unique y slices. Then run `generate_co2_xz_dataset.py` to create four source families (three controlled synthetic regimes and SPE10, with Tarbert and Upper Ness kept as separate cohorts), four-episode/six-stage action trajectories, and train/validation/test files. Splits are made by synthetic geology seed or SPE10 y slice; Tarbert and Ness share the same held-out y-slice groups and action schedules. The synthetic scalar-k maps are rank-mapped to pooled SPE10 Kx/Kz marginal distributions and assigned a declared 1,200 ft by 100 ft domain; this is a scenario scaling assumption that needs expert review, not a calibrated physical model. The generator resamples each cohort to 24×24, so its outputs are appropriate for an initial common-grid surrogate experiment only. Preserve the raw geology archive and record these assumptions with every run.
+
+Kaggle data-preparation command after cloning the current branch and locating the attached SPE10 files:
+
+```bash
+!python /kaggle/working/surrogate_repo_co2_pilot/sequential_game/co2_experiment.py \
+  --out /kaggle/working/co2_geologies_v2 --n 24 --n-per-regime 24 \
+  --n-per-spe10-region 24 --spe10-dir "$SPE_DIR" --spe10-xz
+!python /kaggle/working/surrogate_repo_co2_pilot/sequential_game/generate_co2_xz_dataset.py \
+  --input-dir /kaggle/working/co2_geologies_v2 \
+  --out-dir /kaggle/working/co2_xz_dataset \
+  --target-n 24 --episodes-per-geology 4 --stages 6 --stage-days 30
+```
+
+This is CPU/SciPy solver work; the Kaggle T4 GPUs are not used by these commands. The default run is a first training dataset, not a confirmatory benchmark. Review `split_manifest.csv`, `stage_metrics.csv`, and the scaling assumptions before fitting models. Do not use test transitions to choose architectures or preprocessing.
+
+For the initial solver smoke pilot, use two SPE10 slices from each region, symmetric and alternating two-operator rates, and three 30-day stages. A modest 2× x/z coarsening keeps that CPU run small; geometric-mean coarsening is not flow-preserving upscaling. It is enough to inspect solver outputs and rough runtime, not enough to train or claim a generalizing surrogate.
 
 Kaggle commands, after the geology-preparation cell has created `/kaggle/working/co2_geologies/co2_geology_cohorts.npz`:
 
 ```bash
-!git -C /kaggle/working/surrogate_repo pull origin codex/ccs-lstm-fno-variants
-!python /kaggle/working/surrogate_repo/sequential_game/test_co2_xz_solver.py
-!python /kaggle/working/surrogate_repo/sequential_game/generate_co2_xz_pilot.py \
+!git -C /kaggle/working/surrogate_repo_co2_pilot pull origin codex/ccs-lstm-fno-variants
+!python /kaggle/working/surrogate_repo_co2_pilot/sequential_game/test_co2_xz_solver.py
+!python /kaggle/working/surrogate_repo_co2_pilot/sequential_game/generate_co2_xz_pilot.py \
   --input-dir /kaggle/working/co2_geologies \
   --out-dir /kaggle/working/co2_xz_pilot \
   --geologies-per-region 2 --stages 3 --stage-days 30 \
