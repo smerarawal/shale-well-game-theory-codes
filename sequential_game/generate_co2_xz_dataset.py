@@ -56,9 +56,22 @@ def _resample(a, target_z, target_x, *, geometric=False):
 
 def _split_geologies(cases, *, spe10, seed):
     """Return index lists, keeping all matching y sections in one split."""
+    if spe10:
+        result = {name: [] for name in SPLITS}
+        for i, case in enumerate(cases):
+            y = int(case["metadata"]["spe10_y_index"])
+            if y < 73 or y >= 147:
+                result["train"].append(i)
+            elif y < 110:
+                result["validation"].append(i)
+            else:
+                result["test"].append(i)
+        if any(not result[name] for name in SPLITS):
+            raise ValueError("SPE10 archive must include sampled y-slices from all three spatial split blocks")
+        return result
     groups = {}
     for i, case in enumerate(cases):
-        group = int(case["metadata"].get("spe10_y_index", case["seed"])) if spe10 else int(case["seed"])
+        group = int(case["seed"])
         groups.setdefault(group, []).append(i)
     group_ids = np.asarray(sorted(groups), dtype=np.int64)
     if len(group_ids) < 3:
