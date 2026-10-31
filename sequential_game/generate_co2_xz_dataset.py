@@ -33,11 +33,13 @@ def _metadata(raw):
     return json.loads(value) if isinstance(value, str) else dict(value)
 
 
-def _resample(a, target_z, target_x, *, geometric=False):
-    """Geometric/log K block reduction; nearest replication only when enlarging."""
+def _resample(a, target_z, target_x, *, method="arithmetic"):
+    """Block-reduce a field with a declared average; replicate only when enlarging."""
     a = np.asarray(a, dtype=np.float64)
     if a.ndim != 2:
         raise ValueError("geology fields must be 2D [z,x]")
+    if method not in ("arithmetic", "harmonic", "geometric"):
+        raise ValueError(f"unknown resampling method: {method}")
     if target_z >= a.shape[0] and target_x >= a.shape[1]:
         zi = np.minimum((np.arange(target_z) * a.shape[0] / target_z).astype(int), a.shape[0] - 1)
         xi = np.minimum((np.arange(target_x) * a.shape[1] / target_x).astype(int), a.shape[1] - 1)
@@ -50,7 +52,12 @@ def _resample(a, target_z, target_x, *, geometric=False):
             x0, x1 = int(np.floor(ix * a.shape[1] / target_x)), int(np.ceil((ix + 1) * a.shape[1] / target_x))
             x1 = max(x1, x0 + 1)
             block = np.maximum(a[z0:z1, x0:x1], 1e-30)
-            out[iz, ix] = np.exp(np.log(block).mean()) if geometric else block.mean()
+            if method == "arithmetic":
+                out[iz, ix] = block.mean()
+            elif method == "harmonic":
+                out[iz, ix] = 1.0 / np.mean(1.0 / block)
+            else:
+                out[iz, ix] = np.exp(np.log(block).mean())
     return out
 
 
@@ -148,8 +155,10 @@ def _build_cases(npz, target_n):
             # Common 1,200 ft by 100 ft synthetic x-z domain; these dimensions
             # are declared scenario assumptions, not field measurements.
             cases_by_cohort[cohort].append({
-                "kx": _resample(kx, target_n, target_n, geometric=True),
-                "kz": _resample(kz, target_n, target_n, geometric=True),
+                # Directional block upscaling follows the expert review's
+                # first-order recommendation: arithmetic Kx, harmonic Kz.
+                "kx": _resample(kx, target_n, target_n, method="arithmetic"),
+                "kz": _resample(kz, target_n, target_n, method="harmonic"),
                 "phi": _resample(phiarr[i], target_n, target_n),
                 "seed": int(seeds[i]), "metadata": {
                     **meta, "source_type": "synthetic_rank_mapped_to_SPE10_marginals",
@@ -168,8 +177,8 @@ def _build_cases(npz, target_n):
             meta = _metadata(metadata[i])
             z_extent_ft = float(meta["dz_ft"]) * kxs[i].shape[0]
             cases_by_cohort[region].append({
-                "kx": _resample(kxs[i], target_n, target_n, geometric=True),
-                "kz": _resample(kzs[i], target_n, target_n, geometric=True),
+                "kx": _resample(kxs[i], target_n, target_n, method="arithmetic"),
+                "kz": _resample(kzs[i], target_n, target_n, method="harmonic"),
                 "phi": _resample(phis[i], target_n, target_n),
                 "seed": int(seeds[i]),
                 "metadata": {**meta, "dx_ft": 1200.0 / target_n,
@@ -318,7 +327,7 @@ def main():
               "split_unit": "synthetic geology seed; SPE10 y slice",
               "transitions": len(all_metrics),
               "synthetic_scaling": "rank-map scalar synthetic k to pooled SPE10 directional Kx/Kz marginals; fixed 1200 ft x 100 ft domain",
-              "grid_resampling": "24x24; geometric block means for permeability downsampling; nearest replication only when upsampling",
+              "grid_resampling": "24x24; arithmetic block means for horizontal Kx, harmonic block means for vertical Kz, arithmetic porosity means; nearest replication only when upsampling",
               "physics_limits": ["experimental 2D x-z IMPES model", "not field calibrated", "no capillary pressure", "closed outer boundaries", "constant phase properties", "simplified dissolution and residual trapping", "not a 3D model"]}
     (out_dir / "dataset_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     print(f"Complete: {len(all_metrics)} stage transitions in {out_dir}")
