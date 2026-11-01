@@ -376,8 +376,14 @@ def main():
     train = {c: load_cohort(data_dir, "train", c) for c in COHORTS}
     val = {c: load_cohort(data_dir, "validation", c) for c in COHORTS}
     test = {c: load_cohort(data_dir, "test", c) for c in COHORTS}
-    rate_scale = max(float(max(np.max(d["rate_operator_0_m3_s"]),
-                               np.max(d["rate_operator_1_m3_s"])) for d in train.values()), 1e-12)
+    rate_scale = max(
+        max(
+            float(max(np.max(d["rate_operator_0_m3_s"]),
+                      np.max(d["rate_operator_1_m3_s"])))
+            for d in train.values()
+        ),
+        1e-12,
+    )
     x_parts = [build_x(d, rate_scale) for d in train.values()]
     y_parts = [build_y(d) for d in train.values()]
     x_train, y_train = np.concatenate(x_parts), np.concatenate(y_parts)
