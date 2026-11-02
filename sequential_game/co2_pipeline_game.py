@@ -92,6 +92,7 @@ class CO2GameConfig:
     n_operators: int
     horizon: int = 6
     stage_duration_s: float = 30.0 * 86400.0
+    discount_factor: float = 1.0 / 1.05
     storage_cap_kg: float | None = None
     storage_dispatch_rule: str = "proportional"
     pipeline: PipelineConfig | None = None
@@ -102,6 +103,8 @@ class CO2GameConfig:
             raise ValueError("the shared-resource game requires at least two operators")
         if self.horizon < 1 or self.stage_duration_s <= 0:
             raise ValueError("horizon and stage duration must be positive")
+        if not np.isfinite(self.discount_factor) or not 0 < self.discount_factor <= 1:
+            raise ValueError("discount_factor must lie in (0,1]")
         if self.storage_cap_kg is not None and (
                 not np.isfinite(self.storage_cap_kg) or self.storage_cap_kg < 0):
             raise ValueError("storage_cap_kg must be None or finite and nonnegative")
@@ -376,6 +379,9 @@ def advance_stage(
     resource_welfare = float(
         storage_credit_by_op.sum() - drilling_cost_by_op.sum()
         - pipeline_cost_by_op.sum() - shared_damage)
+    discount_applied = config.discount_factor ** state.stage
+    discounted_operator_payoff = operator_payoff * discount_applied
+    discounted_resource_welfare = resource_welfare * discount_applied
 
     next_injected = state.cumulative_injected_kg_by_operator + injected_by_op
     next_delivered = state.cumulative_pipeline_delivered_kg_by_operator + delivered_mass
@@ -395,8 +401,8 @@ def advance_stage(
         cumulative_injected_kg_by_operator=next_injected,
         cumulative_pipeline_delivered_kg_by_operator=next_delivered,
         active_wells_by_operator=tuple(next_wells_by_operator),
-        cumulative_welfare=state.cumulative_welfare + resource_welfare,
-        cumulative_payoff_by_operator=prior_payoffs + operator_payoff,
+        cumulative_welfare=state.cumulative_welfare + discounted_resource_welfare,
+        cumulative_payoff_by_operator=prior_payoffs + discounted_operator_payoff,
         belief_state=tuple(next_beliefs),
     )
     record = {
@@ -418,8 +424,11 @@ def advance_stage(
         "plume_damage_cost": plume_cost,
         "boundary_damage_cost": boundary_cost,
         "operator_payoff_by_operator": operator_payoff.tolist(),
+        "discount_factor_applied": discount_applied,
+        "discounted_operator_payoff_by_operator": discounted_operator_payoff.tolist(),
         "storage_credit_by_operator": storage_credit_by_op.tolist(),
         "project_resource_welfare": resource_welfare,
+        "discounted_project_resource_welfare": discounted_resource_welfare,
         "solver_diagnostics": diagnostics,
         "observations_by_operator": list(observations),
         "pipeline_model": "stage_capacity_v1",
