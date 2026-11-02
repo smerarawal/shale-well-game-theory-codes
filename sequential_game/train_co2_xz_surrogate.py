@@ -171,7 +171,8 @@ class CCSConvLSTM(nn.Module):
     def __init__(self, cin, width, cout):
         super().__init__()
         self.enc = _Encoder(cin, width)
-        self.temporal = ConvLSTMCell(width)
+        # _Encoder's bottleneck (f2) has 4 * width channels.
+        self.temporal = ConvLSTMCell(width * 4)
         self.dec = _Decoder(width, cout)
 
     def step(self, x, hidden=None):
