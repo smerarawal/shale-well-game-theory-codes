@@ -76,6 +76,41 @@ class CO2XZSolverChecks(unittest.TestCase):
         self.assertLess(abs(diag["mass_balance_residual_kg"]), 1e-8)
         self.assertLess(float(np.max(result["sg_mobile"])), float(np.max(state["sg_mobile"])))
 
+    def test_dissolution_alone_does_not_trigger_residual_trapping(self):
+        cfg = CO2XZConfig(dx_ft=20, dz_ft=2, dy_ft=10,
+                          max_dt_s=1800, max_steps=5000,
+                          solubility_kg_m3_brine=30,
+                          dissolution_rate_s_inv=1e-4,
+                          land_coefficient=3.0)
+        solver = CO2XZSolver(cfg)
+        state = self._bubble_state()
+        result, diag, _ = solver.advance(self.kx, self.kz, self.phi, state, [], 86400,
+                                        gravity_sign=0)
+        self.assertGreater(diag["dissolved_kg"], 0)
+        self.assertAlmostEqual(float(np.sum(result["sg_trapped"])), 0.0, places=14)
+        self.assertLess(abs(diag["mass_balance_residual_kg"]), 1e-8)
+
+    def test_uniform_one_dimensional_source_matches_analytic_pressure_rise(self):
+        # In a homogeneous, no-gravity 1D limit with equal injection in every
+        # cell, pressure remains spatially uniform and follows ct*PV*dP/dt=q.
+        shape = (2, 8)
+        phi = np.full(shape, 0.2)
+        k = np.full(shape, 500.0)
+        rate, duration = 1e-12, 3600.0
+        cfg = CO2XZConfig(dx_ft=20, dz_ft=2, dy_ft=10,
+                          max_dt_s=duration, max_steps=100,
+                          solubility_kg_m3_brine=0,
+                          dissolution_rate_s_inv=0,
+                          land_coefficient=0)
+        solver = CO2XZSolver(cfg)
+        state = initial_state(shape)
+        wells = [(z, x, rate) for z in range(shape[0]) for x in range(shape[1])]
+        result, _, _ = solver.advance(k, k, phi, state, wells, duration,
+                                      gravity_sign=0)
+        expected = rate * duration / (
+            phi[0, 0] * cfg.total_compressibility_pa_inv * solver.cell_volume)
+        np.testing.assert_allclose(result["p_pa"], expected, rtol=1e-10, atol=1e-12)
+
     def test_injection_dissolution_and_trapping_conserve_component_mass(self):
         cfg = CO2XZConfig(dx_ft=20, dz_ft=2, dy_ft=10,
                           max_dt_s=1800, max_steps=5000,

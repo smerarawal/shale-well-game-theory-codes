@@ -81,11 +81,12 @@ class CCSNet(nn.Module):
         super().__init__()
         self.enc = _Encoder(cin, width)
         self.pressure = _Decoder(width, 1)
-        self.co2 = _Decoder(width, cout - 1)
+        self.co2 = _Decoder(width, cout - 1) if cout > 1 else None
 
     def forward(self, x):
         f = self.enc(x)
-        return torch.cat((self.pressure(*f), self.co2(*f)), 1)
+        p = self.pressure(*f)
+        return p if self.co2 is None else torch.cat((p, self.co2(*f)), 1)
 
 
 def _shift(x, dz, dx):
@@ -110,7 +111,7 @@ class GridGNN(nn.Module):
                                   nn.Conv2d(width, cout, 1))
         self.dirs = ((0, 1), (0, -1), (1, 0), (-1, 0))
 
-    def forward(self, x):
+    def features(self, x):
         h = self.enc(x)
         kx, kz = x[:, 0:1], x[:, 1:2]
         for layers in zip(self.msg, self.upd):
@@ -123,7 +124,81 @@ class GridGNN(nn.Module):
                                   ((_shift(kz, dz, dx) - kz).abs() * mask)), 1)
                 messages.append(net(torch.cat((h, neigh, edge), 1)))
             h = h + update(torch.cat((h, *messages), 1))
-        return self.head(h)
+        return h
+
+    def forward(self, x):
+        return self.head(self.features(x))
+
+
+class CCSGNN(nn.Module):
+    """Dual spatial branch: CCS encoder/decoder plus permeability-aware GNN."""
+    def __init__(self, cin, width, cout):
+        super().__init__()
+        self.ccs_encoder = _Encoder(cin, width)
+        self.gnn = GridGNN(cin, width, cout, layers=5)
+        self.gnn.head = nn.Identity()  # fusion consumes node features directly
+        self.fuse = _block(width * 2, width)
+        self.pressure = _Decoder(width, 1)
+        self.co2 = _Decoder(width, cout - 1) if cout > 1 else None
+
+    def forward(self, x):
+        f0, f1, f2 = self.ccs_encoder(x)
+        g = self.gnn.features(x)
+        f0 = self.fuse(torch.cat((f0, g), dim=1))
+        p = self.pressure(f0, f1, f2)
+        return p if self.co2 is None else torch.cat((p, self.co2(f0, f1, f2)), dim=1)
+
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        self.gates = nn.Conv2d(channels * 2, channels * 4, kernel_size,
+                               padding=kernel_size // 2)
+
+    def forward(self, x, hidden=None):
+        if hidden is None:
+            h = torch.zeros_like(x); c = torch.zeros_like(x)
+        else:
+            h, c = hidden
+        i, f, o, g = self.gates(torch.cat((x, h), dim=1)).chunk(4, dim=1)
+        c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+        h = torch.sigmoid(o) * torch.tanh(c)
+        return h, (h, c)
+
+
+class CCSConvLSTM(nn.Module):
+    """CCS encoder-decoder with a ConvLSTM state at the bottleneck."""
+    def __init__(self, cin, width, cout):
+        super().__init__()
+        self.enc = _Encoder(cin, width)
+        self.temporal = ConvLSTMCell(width)
+        self.dec = _Decoder(width, cout)
+
+    def step(self, x, hidden=None):
+        f0, f1, f2 = self.enc(x)
+        h, hidden = self.temporal(f2, hidden)
+        return self.dec(f0, f1, h), hidden
+
+    def forward(self, x):
+        return self.step(x, None)[0]
+
+
+class GNNConvLSTM(nn.Module):
+    """Permeability-aware GNN features with recurrent stage memory."""
+    def __init__(self, cin, width, cout):
+        super().__init__()
+        self.gnn = GridGNN(cin, width, cout)
+        self.gnn.head = nn.Identity()  # recurrent head replaces the GNN output head
+        self.temporal = ConvLSTMCell(width)
+        self.head = nn.Sequential(nn.Conv2d(width, width, 1), nn.GELU(),
+                                  nn.Conv2d(width, cout, 1))
+
+    def step(self, x, hidden=None):
+        h, hidden = self.temporal(self.gnn.features(x), hidden)
+        return self.head(h), hidden
+
+    def forward(self, x):
+        return self.step(x, None)[0]
 
 
 class SpectralConv2d(nn.Module):
@@ -174,12 +249,13 @@ class UFNO(nn.Module):
         return self.fuse(torch.cat((self.global_path(x), self.local_path(x)), 1))
 
 
-def make_model(name, width):
+def make_model(name, width, cin=14, cout=len(STATE_KEYS)):
     makers = {"unet": UNet, "ccs": CCSNet, "gnn": GridGNN,
-              "fno": FNO, "ufno": UFNO}
+              "fno": FNO, "ufno": UFNO, "ccs_gnn": CCSGNN,
+              "ccs_lstm": CCSConvLSTM, "gnn_lstm": GNNConvLSTM}
     if name not in makers:
         raise ValueError(f"unknown backbone {name}")
-    return makers[name](14, width, len(STATE_KEYS))
+    return makers[name](cin, width, cout)
 
 
 def _npz(path):
@@ -225,6 +301,107 @@ def fit_stats(x, y):
             "y_mean": ym.astype(np.float32), "y_std": ys.astype(np.float32)}
 
 
+def _sequence_windows(datasets, unroll):
+    """Return row-index windows, keeping geology/schedule episodes intact."""
+    windows, offset = [], 0
+    for data in datasets.values():
+        groups = {}
+        for i, (geology, episode) in enumerate(zip(data["geology_seed"], data["episode_id"])):
+            groups.setdefault((int(geology), int(episode)), []).append(i)
+        for rows in groups.values():
+            rows.sort(key=lambda j: int(data["stage_index"][j]))
+            for start in range(max(0, len(rows) - unroll + 1)):
+                window = rows[start:start + unroll]
+                stages = [int(data["stage_index"][j]) for j in window]
+                if stages == list(range(stages[0], stages[0] + unroll)):
+                    windows.append([offset + j for j in window])
+        offset += len(data["geology_seed"])
+    return np.asarray(windows, dtype=np.int64)
+
+
+def _torch_project(state, previous):
+    """Inference projection used between pushforward training steps."""
+    result = {k: state[:, i] for i, k in enumerate(STATE_KEYS)}
+    result["sg_trapped"] = torch.maximum(result["sg_trapped"], previous[:, 2]).clamp(0.0, 1.0 - SWC)
+    result["sg_mobile"] = result["sg_mobile"].clamp_min(0.0)
+    result["sg_mobile"] = torch.minimum(result["sg_mobile"], 1.0 - SWC - result["sg_trapped"])
+    result["sg_max"] = torch.maximum(result["sg_max"], previous[:, 3])
+    result["sg_max"] = torch.maximum(result["sg_max"], result["sg_mobile"] + result["sg_trapped"])
+    result["sg_max"] = result["sg_max"].clamp(0.0, 1.0 - SWC)
+    land_cap = result["sg_max"] / (1.0 + 2.0 * result["sg_max"])
+    result["sg_trapped"] = torch.minimum(result["sg_trapped"], land_cap)
+    dissolved_cap = 30.0 * (1.0 - result["sg_mobile"] - result["sg_trapped"])
+    result["c_dissolved_kg_m3"] = torch.minimum(
+        result["c_dissolved_kg_m3"].clamp_min(0.0), dissolved_cap)
+    return torch.stack([result[k] for k in STATE_KEYS], dim=1)
+
+
+def _batch_loss(pred, y_target, state_in, pv, injected, y_std, y_mean,
+                valid_weight, mass_weight):
+    """Normalized field loss plus pressure-peak, validity, and mass penalties."""
+    target_norm = (y_target - y_mean) / y_std
+    loss_field = F.mse_loss(pred, target_norm)
+    delta = pred * y_std + y_mean
+    raw = state_in + delta
+    target_out = state_in + y_target
+    pmax_loss = (F.mse_loss(raw[:, 0].flatten(1).amax(1),
+                            target_out[:, 0].flatten(1).amax(1))
+                 / (y_std[0, 0, 0, 0].square() + 1e-12))
+    sm, st, smx, cd = raw[:, 1], raw[:, 2], raw[:, 3], raw[:, 4]
+    valid = (F.relu(-sm).square().mean()
+             + F.relu(state_in[:, 2] - st).square().mean()
+             + F.relu(-st).square().mean()
+             + F.relu(sm + st - (1.0 - SWC)).square().mean()
+             + F.relu(state_in[:, 3] - smx).square().mean()
+             + F.relu(sm + st - smx).square().mean()
+             + F.relu(st - smx / (1.0 + 2.0 * smx.clamp_min(0.0))).square().mean()
+             + F.relu(-cd / 30.0).square().mean()
+             + F.relu((cd - 30.0 * (1.0 - sm - st)) / 30.0).square().mean())
+    mass_out = (RHO_CO2 * pv * (sm + st) + pv * (1.0 - sm - st) * cd).sum((1, 2))
+    mass_in = (RHO_CO2 * pv * (state_in[:, 1] + state_in[:, 2])
+               + pv * (1.0 - state_in[:, 1] - state_in[:, 2]) * state_in[:, 4]).sum((1, 2))
+    mass = (((mass_out - mass_in - injected) / injected.abs().clamp_min(1.0)) ** 2).mean()
+    return loss_field + 0.5 * pmax_loss + valid_weight * valid + mass_weight * mass
+
+
+def _train_pushforward_epoch(model, optimizer, windows, sequence_data,
+                             state_train, y_train, pv_train, inject_train,
+                             rate_scale, stats, device, args):
+    """Train three consecutive stages, detaching each predicted state."""
+    order = np.random.permutation(len(windows))
+    y_std = torch.as_tensor(stats["y_std"], device=device)
+    y_mean = torch.as_tensor(stats["y_mean"], device=device)
+    run = 0.0
+    for start in range(0, len(order), args.batch_size):
+        seq = windows[order[start:start + args.batch_size]]
+        dynamic = state_train[seq[:, 0]].copy()
+        optimizer.zero_grad(set_to_none=True)
+        losses = []
+        for step in range(args.rollout_unroll):
+            ids = seq[:, step]
+            sample = {key: value[ids] for key, value in sequence_data.items()}
+            dyn = {key: dynamic[:, i] for i, key in enumerate(STATE_KEYS)}
+            x = build_x(sample, rate_scale, dyn)
+            x = ((x - stats["x_mean"]) / stats["x_std"]).astype(np.float32)
+            state_in = torch.from_numpy(dynamic).to(device)
+            true_out = torch.from_numpy(state_train[ids] + y_train[ids]).to(device)
+            target_delta = true_out - state_in
+            pred = model(torch.from_numpy(x).to(device))
+            losses.append(_batch_loss(
+                pred, target_delta, state_in,
+                torch.from_numpy(pv_train[ids]).to(device),
+                torch.from_numpy(inject_train[ids]).to(device),
+                y_std, y_mean, args.valid_loss_weight, args.mass_loss_weight))
+            raw_out = state_in + pred * y_std + y_mean
+            dynamic = _torch_project(raw_out, state_in).detach().cpu().numpy()
+        loss = torch.stack(losses).mean()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        run += float(loss.detach()) * len(seq)
+    return run
+
+
 def _to_states(data, pred_delta, dynamic=None):
     base = dynamic or {key: data[f"{key}_in"] for key in STATE_KEYS}
     result = {}
@@ -232,11 +409,17 @@ def _to_states(data, pred_delta, dynamic=None):
         result[key] = base[key] + pred_delta[:, i]
     result["sg_trapped"] = np.maximum(result["sg_trapped"], base["sg_trapped"])
     result["sg_trapped"] = np.clip(result["sg_trapped"], 0, 1 - SWC)
-    result["sg_mobile"] = np.clip(result["sg_mobile"], 0, 1 - SWC - result["sg_trapped"])
     result["sg_max"] = np.clip(np.maximum.reduce((result["sg_max"], base["sg_max"],
-                                                  result["sg_mobile"] + result["sg_trapped"])),
+                                                   result["sg_mobile"] + result["sg_trapped"])),
                                 0, 1 - SWC)
-    result["c_dissolved_kg_m3"] = np.clip(result["c_dissolved_kg_m3"], 0, 30.0)
+    land_cap = result["sg_max"] / (1.0 + 2.0 * result["sg_max"])
+    result["sg_trapped"] = np.minimum(result["sg_trapped"], land_cap)
+    result["sg_mobile"] = np.clip(result["sg_mobile"], 0, 1 - SWC - result["sg_trapped"])
+    result["sg_max"] = np.clip(np.maximum(result["sg_max"],
+                                           result["sg_mobile"] + result["sg_trapped"]),
+                                0, 1 - SWC)
+    dissolved_cap = 30.0 * (1.0 - result["sg_mobile"] - result["sg_trapped"])
+    result["c_dissolved_kg_m3"] = np.clip(result["c_dissolved_kg_m3"], 0, dissolved_cap)
     return result
 
 
@@ -302,12 +485,48 @@ def _pred_batch(model, data, stats, rate_scale, device):
     return _to_states(data, delta)
 
 
+def _raw_validity(data, delta):
+    """Violation fractions before the inference projection is applied."""
+    raw = {key: data[f"{key}_in"] + delta[:, i]
+           for i, key in enumerate(STATE_KEYS)}
+    sm, st = raw["sg_mobile"], raw["sg_trapped"]
+    smx, cd = raw["sg_max"], raw["c_dissolved_kg_m3"]
+    land = smx / np.maximum(1.0 + 2.0 * smx, 1e-12)
+    dissolved_cap = 30.0 * (1.0 - sm - st)
+    return {"negative_mobile_fraction": float(np.mean(sm < 0)),
+            "trapped_decrease_fraction": float(np.mean(st < data["sg_trapped_in"])),
+            "saturation_sum_over_0p85_fraction": float(np.mean(sm + st > 1.0 - SWC)),
+            "sgmax_decrease_fraction": float(np.mean(smx < data["sg_max_in"])),
+            "land_trapping_bound_violation_fraction": float(np.mean(st > land)),
+            "dissolution_capacity_violation_fraction": float(np.mean(cd > dissolved_cap)),
+            "negative_dissolved_fraction": float(np.mean(cd < 0))}
+
+
+def _inference_ms_batch1(model, data, stats, rate_scale, device, repeats=30):
+    x = build_x({key: value[:1] for key, value in data.items()
+                 if isinstance(value, np.ndarray) and value.ndim > 0
+                 and len(value) == len(data["geology_seed"])}, rate_scale)
+    xn = torch.from_numpy(((x - stats["x_mean"]) / stats["x_std"]).astype(np.float32)).to(device)
+    sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
+    model.eval()
+    with torch.no_grad():
+        for _ in range(5):
+            model(xn)
+        sync(); t0 = time.perf_counter()
+        for _ in range(repeats):
+            model(xn)
+        sync()
+    return 1000.0 * (time.perf_counter() - t0) / repeats
+
+
 def evaluate_one_step(model, datasets, stats, rate_scale, device, args):
     results = {}
     for cohort, data in datasets.items():
         truth = {key: data[f"{key}_out"] for key in STATE_KEYS}
-        pred = _pred_batch(model, data, stats, rate_scale, device)
+        delta = predict_delta(model, data, stats, rate_scale, device)
+        pred = _to_states(data, delta)
         results[cohort] = score_states(pred, truth, data, args)
+        results[cohort]["raw_validity_before_projection"] = _raw_validity(data, delta)
     return results
 
 
@@ -316,9 +535,9 @@ def evaluate_rollout(model, datasets, stats, rate_scale, device, args):
     for cohort, data in datasets.items():
         keys = list(zip(data["geology_seed"].tolist(), data["episode_id"].tolist()))
         order = np.lexsort((data["stage_index"], data["episode_id"], data["geology_seed"]))
-        pred_rows, true_rows, input_states, input_rows = ({k: [] for k in STATE_KEYS},
-                                                          {k: [] for k in STATE_KEYS},
-                                                          {k: [] for k in STATE_KEYS}, [])
+        pred_rows, true_rows, input_states, input_rows, stage_rows = (
+            {k: [] for k in STATE_KEYS}, {k: [] for k in STATE_KEYS},
+            {k: [] for k in STATE_KEYS}, [], [])
         start = 0
         while start < len(order):
             first = order[start]
@@ -330,17 +549,26 @@ def evaluate_rollout(model, datasets, stats, rate_scale, device, args):
             if len(group) != 6:
                 continue
             state = {k: data[f"{k}_in"][group[0]:group[0] + 1].copy() for k in STATE_KEYS}
+            hidden = None
             for j in group:
                 one = {k: v[j:j + 1] for k, v in data.items()
                        if isinstance(v, np.ndarray) and v.ndim > 0 and len(v) == len(data["geology_seed"])}
                 for k in STATE_KEYS:
                     input_states[k].append(state[k][0].copy())
-                dy = predict_delta(model, one, stats, rate_scale, device, dynamic=state)
+                if hasattr(model, "step"):
+                    xx = build_x(one, rate_scale, state)
+                    xn = torch.from_numpy(((xx - stats["x_mean"]) / stats["x_std"]).astype(np.float32)).to(device)
+                    with torch.no_grad():
+                        out, hidden = model.step(xn, hidden)
+                    dy = out.cpu().numpy() * stats["y_std"] + stats["y_mean"]
+                else:
+                    dy = predict_delta(model, one, stats, rate_scale, device, dynamic=state)
                 pstate = _to_states(one, dy, dynamic=state)
                 for k in STATE_KEYS:
                     pred_rows[k].append(pstate[k][0])
                     true_rows[k].append(data[f"{k}_out"][j])
                 input_rows.append(j)
+                stage_rows.append(int(data["stage_index"][j]))
                 state = {k: pstate[k] for k in STATE_KEYS}
         if input_rows:
             ids = np.asarray(input_rows, dtype=int)
@@ -350,7 +578,17 @@ def evaluate_rollout(model, datasets, stats, rate_scale, device, args):
                       if isinstance(v, np.ndarray) and v.ndim > 0 and len(v) == len(data["geology_seed"])}
             for k in STATE_KEYS:
                 subset[f"{k}_in"] = np.stack(input_states[k])
-            results[cohort] = score_states(pred, truth, subset, args)
+            overall = score_states(pred, truth, subset, args)
+            by_stage = {}
+            stage_rows = np.asarray(stage_rows)
+            for stage in sorted(np.unique(stage_rows).tolist()):
+                mask = stage_rows == stage
+                stage_data = {k: v[mask] for k, v in subset.items()}
+                stage_pred = {k: v[mask] for k, v in pred.items()}
+                stage_truth = {k: v[mask] for k, v in truth.items()}
+                by_stage[str(stage)] = score_states(stage_pred, stage_truth, stage_data, args)
+            overall["by_stage"] = by_stage
+            results[cohort] = overall
         else:
             results[cohort] = {"error": "no six-stage episodes found"}
     return results
@@ -361,13 +599,21 @@ def main():
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--backbones", nargs="+", default=["unet", "ccs", "gnn", "fno", "ufno"],
-                    choices=["unet", "ccs", "gnn", "fno", "ufno"])
+                    choices=["unet", "ccs", "gnn", "fno", "ufno", "ccs_gnn", "ccs_lstm", "gnn_lstm"])
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--patience", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--width", type=int, default=32)
     ap.add_argument("--learning-rate", type=float, default=8e-4)
+    ap.add_argument("--mass-loss-weight", type=float, default=0.0,
+                    help="soft stage mass-balance loss weight; zero preserves baseline training")
+    ap.add_argument("--valid-loss-weight", type=float, default=0.0,
+                    help="penalize raw invalid saturation/trapping/dissolution outputs before clipping")
+    ap.add_argument("--rollout-unroll", type=int, choices=[1, 3], default=1,
+                    help="independent transitions or three-stage pushforward training windows")
+    ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                    help="reuse completed seed checkpoints and metrics already in the output folder")
     ap.add_argument("--stage-days", type=float, default=30.0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -376,11 +622,37 @@ def main():
     train = {c: load_cohort(data_dir, "train", c) for c in COHORTS}
     val = {c: load_cohort(data_dir, "validation", c) for c in COHORTS}
     test = {c: load_cohort(data_dir, "test", c) for c in COHORTS}
-    rate_scale = max(float(max(np.max(d["rate_operator_0_m3_s"]),
-                               np.max(d["rate_operator_1_m3_s"])) for d in train.values()), 1e-12)
+    rate_scale = max(
+        max(
+            float(max(np.max(d["rate_operator_0_m3_s"]),
+                      np.max(d["rate_operator_1_m3_s"])))
+            for d in train.values()
+        ),
+        1e-12,
+    )
     x_parts = [build_x(d, rate_scale) for d in train.values()]
     y_parts = [build_y(d) for d in train.values()]
     x_train, y_train = np.concatenate(x_parts), np.concatenate(y_parts)
+    pv_parts, inject_parts, state_parts = [], [], []
+    for d in train.values():
+        cell_volume = ((d["dx_ft"] * 0.3048) * (d["dy_ft"] * 0.3048)
+                       * (d["dz_ft"] * 0.3048))
+        pv_parts.append(d["phi"] * cell_volume[:, None, None])
+        inject_parts.append(RHO_CO2 * (d["rate_operator_0_m3_s"]
+                                      + d["rate_operator_1_m3_s"])
+                            * args.stage_days * 86400.0)
+        state_parts.append(np.stack([d[f"{key}_in"] for key in STATE_KEYS], axis=1))
+    pv_train = np.concatenate(pv_parts).astype(np.float32)
+    inject_train = np.concatenate(inject_parts).astype(np.float32)
+    state_train = np.concatenate(state_parts).astype(np.float32)
+    sequence_keys = ("kx_mD", "kz_mD", "phi", "rate_operator_0_m3_s",
+                     "rate_operator_1_m3_s", "dx_ft", "dy_ft", "dz_ft")
+    sequence_data = {key: np.concatenate([d[key] for d in train.values()])
+                     for key in sequence_keys}
+    sequence_windows = (_sequence_windows(train, args.rollout_unroll)
+                        if args.rollout_unroll > 1 else None)
+    if args.rollout_unroll > 1 and not len(sequence_windows):
+        raise ValueError("No consecutive episode windows found for rollout-aware training")
     stats = fit_stats(x_train, y_train)
     X = ((x_train - stats["x_mean"]) / stats["x_std"]).astype(np.float32)
     Y = ((y_train - stats["y_mean"]) / stats["y_std"]).astype(np.float32)
@@ -389,32 +661,82 @@ def main():
     device = torch.device(args.device)
     for backbone in args.backbones:
         for seed in args.seeds:
+            ckpt = out_dir / f"co2_{backbone}_s{seed}.pt"
+            metric_path = out_dir / f"co2_{backbone}_s{seed}_metrics.json"
+            if args.resume and ckpt.exists() and metric_path.exists():
+                best_metrics.append(json.loads(metric_path.read_text(encoding="utf-8")))
+                print(f"[resume] reuse {backbone} seed {seed}", flush=True)
+                continue
             torch.manual_seed(seed); np.random.seed(seed)
             model = make_model(backbone, args.width).to(device)
             params = sum(p.numel() for p in model.parameters())
             opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
             best, best_epoch, stale, t0 = float("inf"), 0, 0, time.time()
-            ckpt = out_dir / f"co2_{backbone}_s{seed}.pt"
             val_X = {c: ((build_x(d, rate_scale) - stats["x_mean"]) / stats["x_std"]).astype(np.float32)
                      for c, d in val.items()}
             val_Y = {c: ((build_y(d) - stats["y_mean"]) / stats["y_std"]).astype(np.float32)
                      for c, d in val.items()}
             for epoch in range(1, args.epochs + 1):
-                model.train(); perm = np.random.permutation(len(X)); run = 0.0
-                for i in range(0, len(perm), args.batch_size):
-                    ids = perm[i:i + args.batch_size]
-                    xb = torch.from_numpy(X[ids]).to(device)
-                    yb = torch.from_numpy(Y[ids]).to(device)
-                    pb = torch.from_numpy(p_in[ids]).to(device)
-                    target_p = pb + torch.from_numpy(y_train[ids, 0]).to(device)
-                    pred = model(xb)
-                    loss_field = F.mse_loss(pred, yb)
-                    p_pred = pb + (pred[:, 0] * stats["y_std"][0, 0, 0, 0] + stats["y_mean"][0, 0, 0, 0])
-                    pmax_loss = F.mse_loss(p_pred.flatten(1).amax(1), target_p.flatten(1).amax(1)) / (stats["y_std"][0, 0, 0, 0] ** 2 + 1e-12)
-                    loss = loss_field + 0.5 * pmax_loss
-                    opt.zero_grad(set_to_none=True); loss.backward()
+                model.train(); run = 0.0
+                y_std_t = torch.as_tensor(stats["y_std"], device=device)
+                y_mean_t = torch.as_tensor(stats["y_mean"], device=device)
+                if args.rollout_unroll == 1:
+                    order = np.random.permutation(len(X))
+                    batches = [order[i:i + args.batch_size]
+                               for i in range(0, len(order), args.batch_size)]
+                else:
+                    order = np.random.permutation(len(sequence_windows))
+                    batches = [sequence_windows[order[i:i + args.batch_size]]
+                               for i in range(0, len(order), args.batch_size)]
+                for batch_ids in batches:
+                    opt.zero_grad(set_to_none=True)
+                    if args.rollout_unroll == 1:
+                        ids = batch_ids
+                        xb = torch.from_numpy(X[ids]).to(device)
+                        state_in = torch.from_numpy(state_train[ids]).to(device)
+                        target_delta = torch.from_numpy(y_train[ids]).to(device)
+                        pv = torch.from_numpy(pv_train[ids]).to(device)
+                        injected = torch.from_numpy(inject_train[ids]).to(device)
+                        pred = model(xb)
+                        loss = _batch_loss(pred, target_delta, state_in, pv,
+                                           injected, y_std_t, y_mean_t,
+                                           args.valid_loss_weight, args.mass_loss_weight)
+                        n_items = len(ids)
+                    else:
+                        seq = batch_ids
+                        dynamic = state_train[seq[:, 0]].copy()
+                        hidden = None
+                        step_losses = []
+                        for step in range(args.rollout_unroll):
+                            ids = seq[:, step]
+                            sample = {key: value[ids] for key, value in sequence_data.items()}
+                            dynamic_map = {key: dynamic[:, si]
+                                           for si, key in enumerate(STATE_KEYS)}
+                            x_np = build_x(sample, rate_scale, dynamic_map)
+                            x_norm = ((x_np - stats["x_mean"]) / stats["x_std"]).astype(np.float32)
+                            xb = torch.from_numpy(x_norm).to(device)
+                            state_in = torch.from_numpy(dynamic).to(device)
+                            true_out = torch.from_numpy(state_train[ids] + y_train[ids]).to(device)
+                            target_delta = true_out - state_in
+                            pv = torch.from_numpy(pv_train[ids]).to(device)
+                            injected = torch.from_numpy(inject_train[ids]).to(device)
+                            if hasattr(model, "step"):
+                                pred, hidden = model.step(xb, hidden)
+                            else:
+                                pred = model(xb)
+                            step_losses.append(_batch_loss(
+                                pred, target_delta, state_in, pv, injected,
+                                y_std_t, y_mean_t, args.valid_loss_weight,
+                                args.mass_loss_weight))
+                            # Push forward but detach state at each stage to
+                            # bound memory use during the three-step unroll.
+                            raw_out = state_in + pred * y_std_t + y_mean_t
+                            dynamic = _torch_project(raw_out, state_in).detach().cpu().numpy()
+                        loss = torch.stack(step_losses).mean()
+                        n_items = len(seq)
+                    loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
-                    run += float(loss.detach()) * len(ids)
+                    run += float(loss.detach()) * n_items
                 model.eval(); val_loss = 0.0; val_n = 0
                 with torch.no_grad():
                     for c in COHORTS:
@@ -443,10 +765,12 @@ def main():
             model.load_state_dict(blob["state_dict"])
             item = {"backbone": backbone, "seed": seed, "params": params,
                     "best_epoch": best_epoch, "train_seconds": round(time.time() - t0),
+                    "inference_ms_sample_batch1": _inference_ms_batch1(
+                        model, next(iter(test.values())), stats, rate_scale, device),
+                    "inference_scope": "network forward only; excludes preprocessing and solver",
                     "best_val_mse": best,
                     "one_step_test": evaluate_one_step(model, test, stats, rate_scale, device, args),
                     "autoregressive_test": evaluate_rollout(model, test, stats, rate_scale, device, args)}
-            metric_path = out_dir / f"co2_{backbone}_s{seed}_metrics.json"
             metric_path.write_text(json.dumps(item, indent=2), encoding="utf-8")
             best_metrics.append(item)
             print(f"Saved {ckpt} and {metric_path}", flush=True)

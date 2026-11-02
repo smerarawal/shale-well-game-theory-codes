@@ -357,8 +357,10 @@ class CO2XZSolver:
                 raise FloatingPointError("mobile gas update exceeded saturation bounds; reduce timestep or injection rate")
             sg_candidate = np.maximum(sg_candidate, 0.0)
 
-            # Hysteretic residual trapping occurs on local gas retreat; it is a
-            # transfer from mobile to immobile gas, not a loss of CO2 mass.
+            # Hysteretic residual trapping is evaluated on the transport update
+            # before dissolution. Therefore a later local dissolution transfer
+            # cannot itself trigger trapping; this models transport retreat as
+            # an imbibition proxy, not dissolution as imbibition.
             gas_total_candidate = sg_candidate + sg_trap
             previous_total = sg_mob + sg_trap
             sg_max = np.maximum(st["sg_max"], gas_total_candidate)
