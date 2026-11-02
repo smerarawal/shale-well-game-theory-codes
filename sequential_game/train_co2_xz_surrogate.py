@@ -338,8 +338,9 @@ def _torch_project(state, previous):
 
 
 def _batch_loss(pred, y_target, state_in, pv, injected, y_std, y_mean,
-                valid_weight, mass_weight):
-    """Normalized field loss plus pressure-peak, validity, and mass penalties."""
+                valid_weight, mass_weight, plume_weight=0.0,
+                plume_threshold=0.01, plume_temperature=0.002):
+    """Normalized field loss plus pressure, validity, mass, and plume penalties."""
     target_norm = (y_target - y_mean) / y_std
     loss_field = F.mse_loss(pred, target_norm)
     delta = pred * y_std + y_mean
@@ -362,13 +363,23 @@ def _batch_loss(pred, y_target, state_in, pv, injected, y_std, y_mean,
     mass_in = (RHO_CO2 * pv * (state_in[:, 1] + state_in[:, 2])
                + pv * (1.0 - state_in[:, 1] - state_in[:, 2]) * state_in[:, 4]).sum((1, 2))
     mass = (((mass_out - mass_in - injected) / injected.abs().clamp_min(1.0)) ** 2).mean()
-    return loss_field + 0.5 * pmax_loss + valid_weight * valid + mass_weight * mass
+    # Soft Dice aligns the mobile-CO2 support with the evaluation plume mask
+    # while keeping the continuous state-field and physics losses active.
+    plume_target = (target_out[:, 1] >= plume_threshold).to(raw.dtype)
+    plume_prob = torch.sigmoid((raw[:, 1] - plume_threshold) /
+                               max(plume_temperature, 1e-6))
+    intersection = (plume_prob * plume_target).sum((1, 2))
+    plume_dice = 1.0 - ((2.0 * intersection + 1e-6) /
+                        (plume_prob.sum((1, 2)) + plume_target.sum((1, 2)) + 1e-6))
+    plume_loss = plume_dice.mean()
+    return (loss_field + 0.5 * pmax_loss + valid_weight * valid
+            + mass_weight * mass + plume_weight * plume_loss)
 
 
 def _train_pushforward_epoch(model, optimizer, windows, sequence_data,
                              state_train, y_train, pv_train, inject_train,
                              rate_scale, stats, device, args):
-    """Train three consecutive stages, detaching each predicted state."""
+    """Train consecutive stages, detaching each predicted state."""
     order = np.random.permutation(len(windows))
     y_std = torch.as_tensor(stats["y_std"], device=device)
     y_mean = torch.as_tensor(stats["y_mean"], device=device)
@@ -392,7 +403,10 @@ def _train_pushforward_epoch(model, optimizer, windows, sequence_data,
                 pred, target_delta, state_in,
                 torch.from_numpy(pv_train[ids]).to(device),
                 torch.from_numpy(inject_train[ids]).to(device),
-                y_std, y_mean, args.valid_loss_weight, args.mass_loss_weight))
+                y_std, y_mean, args.valid_loss_weight, args.mass_loss_weight,
+                getattr(args, "plume_loss_weight", 0.0),
+                getattr(args, "plume_threshold", 0.01),
+                getattr(args, "plume_temperature", 0.002)))
             raw_out = state_in + pred * y_std + y_mean
             dynamic = _torch_project(raw_out, state_in).detach().cpu().numpy()
         loss = torch.stack(losses).mean()
@@ -452,6 +466,9 @@ def score_states(pred, truth, data, args):
     out["pmax_bias_pa"] = float(np.mean(pmax_e))
     out["pmax_abs_p95_pa"] = float(np.percentile(np.abs(pmax_e), 95))
     top_errors, well_errors, plume_iou, plume_fraction = [], [], [], []
+    plume_thresholds = (0.005, 0.01, 0.02)
+    threshold_ious = {threshold: [] for threshold in plume_thresholds}
+    plume_precision, plume_recall = [], []
     h, w = ptrue.shape[-2:]
     well_z, well_x = h - 2, (max(1, w // 3), min(w - 2, (2 * w) // 3))
     for i in range(len(ptrue)):
@@ -459,14 +476,32 @@ def score_states(pred, truth, data, args):
         mask = ptrue[i] >= thresh
         top_errors.extend((ppred[i][mask] - ptrue[i][mask]).ravel().tolist())
         well_errors.extend((ppred[i, well_z, list(well_x)] - ptrue[i, well_z, list(well_x)]).tolist())
-        a, b = pred["sg_mobile"][i] >= 0.01, truth["sg_mobile"][i] >= 0.01
+        a, b = (pred["sg_mobile"][i] >= 0.01,
+                truth["sg_mobile"][i] >= 0.01)
         union = np.logical_or(a, b).sum()
-        plume_iou.append(1.0 if union == 0 else np.logical_and(a, b).sum() / union)
+        intersection = np.logical_and(a, b).sum()
+        plume_iou.append(1.0 if union == 0 else intersection / union)
         plume_fraction.append(abs(float(a.mean()) - float(b.mean())))
+        plume_precision.append(1.0 if a.sum() == 0 and b.sum() == 0
+                               else intersection / max(int(a.sum()), 1))
+        plume_recall.append(1.0 if a.sum() == 0 and b.sum() == 0
+                            else intersection / max(int(b.sum()), 1))
+        for threshold in plume_thresholds:
+            pred_mask = pred["sg_mobile"][i] >= threshold
+            true_mask = truth["sg_mobile"][i] >= threshold
+            threshold_union = np.logical_or(pred_mask, true_mask).sum()
+            threshold_intersection = np.logical_and(pred_mask, true_mask).sum()
+            threshold_ious[threshold].append(
+                1.0 if threshold_union == 0 else threshold_intersection / threshold_union)
     out["pressure_top_decile_rmse_pa"] = float(np.sqrt(np.mean(np.square(top_errors))))
     out["pressure_well_cell_rmse_pa"] = float(np.sqrt(np.mean(np.square(well_errors))))
     out["plume_iou_sg_ge_0p01"] = float(np.mean(plume_iou))
     out["plume_fraction_abs_error"] = float(np.mean(plume_fraction))
+    out["plume_precision_sg_ge_0p01"] = float(np.mean(plume_precision))
+    out["plume_recall_sg_ge_0p01"] = float(np.mean(plume_recall))
+    for threshold, values in threshold_ious.items():
+        key = str(threshold).replace(".", "p")
+        out[f"plume_iou_sg_ge_{key}"] = float(np.mean(values))
     phi = data["phi"]
     cell_m3 = (data["dx_ft"] * 0.3048) * (data["dy_ft"] * 0.3048) * (data["dz_ft"] * 0.3048)
     def mass(s):
@@ -611,8 +646,14 @@ def main():
                     help="soft stage mass-balance loss weight; zero preserves baseline training")
     ap.add_argument("--valid-loss-weight", type=float, default=0.0,
                     help="penalize raw invalid saturation/trapping/dissolution outputs before clipping")
-    ap.add_argument("--rollout-unroll", type=int, choices=[1, 3], default=1,
-                    help="independent transitions or three-stage pushforward training windows")
+    ap.add_argument("--rollout-unroll", type=int, choices=[1, 3, 6], default=1,
+                    help="independent transitions or 3-/6-stage pushforward windows")
+    ap.add_argument("--plume-loss-weight", type=float, default=0.0,
+                    help="soft-Dice weight for the mobile-CO2 plume mask")
+    ap.add_argument("--plume-threshold", type=float, default=0.01,
+                    help="mobile gas saturation cutoff defining plume cells")
+    ap.add_argument("--plume-temperature", type=float, default=0.002,
+                    help="soft threshold width for the differentiable plume mask")
     ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
                     help="reuse completed seed checkpoints and metrics already in the output folder")
     ap.add_argument("--stage-days", type=float, default=30.0)
@@ -672,7 +713,7 @@ def main():
             model = make_model(backbone, args.width).to(device)
             params = sum(p.numel() for p in model.parameters())
             opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
-            best, best_epoch, stale, t0 = float("inf"), 0, 0, time.time()
+            best, best_val_mse, best_epoch, stale, t0 = float("inf"), float("inf"), 0, 0, time.time()
             val_X = {c: ((build_x(d, rate_scale) - stats["x_mean"]) / stats["x_std"]).astype(np.float32)
                      for c, d in val.items()}
             val_Y = {c: ((build_y(d) - stats["y_mean"]) / stats["y_std"]).astype(np.float32)
@@ -701,7 +742,9 @@ def main():
                         pred = model(xb)
                         loss = _batch_loss(pred, target_delta, state_in, pv,
                                            injected, y_std_t, y_mean_t,
-                                           args.valid_loss_weight, args.mass_loss_weight)
+                                           args.valid_loss_weight, args.mass_loss_weight,
+                                           args.plume_loss_weight, args.plume_threshold,
+                                           args.plume_temperature)
                         n_items = len(ids)
                     else:
                         seq = batch_ids
@@ -728,9 +771,10 @@ def main():
                             step_losses.append(_batch_loss(
                                 pred, target_delta, state_in, pv, injected,
                                 y_std_t, y_mean_t, args.valid_loss_weight,
-                                args.mass_loss_weight))
+                                args.mass_loss_weight, args.plume_loss_weight,
+                                args.plume_threshold, args.plume_temperature))
                             # Push forward but detach state at each stage to
-                            # bound memory use during the three-step unroll.
+                            # bound memory use during the rollout unroll.
                             raw_out = state_in + pred * y_std_t + y_mean_t
                             dynamic = _torch_project(raw_out, state_in).detach().cpu().numpy()
                         loss = torch.stack(step_losses).mean()
@@ -739,17 +783,43 @@ def main():
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
                     run += float(loss.detach()) * n_items
                 model.eval(); val_loss = 0.0; val_n = 0
+                val_plume_sum = 0.0; val_plume_n = 0
+                y_std_t = torch.as_tensor(stats["y_std"], device=device)
+                y_mean_t = torch.as_tensor(stats["y_mean"], device=device)
                 with torch.no_grad():
                     for c in COHORTS:
                         vx = torch.from_numpy(val_X[c]).to(device)
                         vy = torch.from_numpy(val_Y[c]).to(device)
+                        state_in_np = np.stack(
+                            [val[c][f"{key}_in"] for key in STATE_KEYS], axis=1
+                        ).astype(np.float32)
+                        state_in_all = torch.from_numpy(state_in_np).to(device)
                         for i in range(0, len(vx), args.batch_size):
-                            pv = model(vx[i:i + args.batch_size])
-                            val_loss += float(F.mse_loss(pv, vy[i:i + args.batch_size], reduction="sum"))
-                            val_n += vy[i:i + args.batch_size].numel()
-                score = val_loss / max(val_n, 1)
+                            sl = slice(i, i + args.batch_size)
+                            pred_norm = model(vx[sl])
+                            target_norm = vy[sl]
+                            val_loss += float(F.mse_loss(pred_norm, target_norm,
+                                                         reduction="sum"))
+                            val_n += target_norm.numel()
+                            if args.plume_loss_weight > 0:
+                                state_in = state_in_all[sl]
+                                pred_out = state_in + pred_norm * y_std_t + y_mean_t
+                                target_out = state_in + target_norm * y_std_t + y_mean_t
+                                pred_prob = torch.sigmoid(
+                                    (pred_out[:, 1] - args.plume_threshold)
+                                    / max(args.plume_temperature, 1e-6))
+                                target_mask = (target_out[:, 1] >= args.plume_threshold).to(pred_prob.dtype)
+                                inter = (pred_prob * target_mask).sum((1, 2))
+                                dice = 1.0 - (2.0 * inter + 1e-6) / (
+                                    pred_prob.sum((1, 2)) + target_mask.sum((1, 2)) + 1e-6
+                                )
+                                val_plume_sum += float(dice.sum())
+                                val_plume_n += len(dice)
+                val_mse = val_loss / max(val_n, 1)
+                val_plume_dice_loss = val_plume_sum / max(val_plume_n, 1)
+                score = val_mse + args.plume_loss_weight * val_plume_dice_loss
                 if score < best:
-                    best, best_epoch, stale = score, epoch, 0
+                    best, best_val_mse, best_epoch, stale = score, val_mse, epoch, 0
                     torch.save({"state_dict": model.state_dict(), "backbone": backbone,
                                 "width": args.width, "seed": seed, "params": params,
                                 "rate_scale": rate_scale,
@@ -759,7 +829,8 @@ def main():
                     stale += 1
                 if epoch == 1 or epoch % 5 == 0:
                     print(f"{backbone} seed {seed} epoch {epoch}: train={run/len(X):.5f} "
-                          f"val={score:.5f} best={best:.5f} ({best_epoch})", flush=True)
+                          f"val_mse={val_mse:.5f} val_objective={score:.5f} "
+                          f"best={best:.5f} ({best_epoch})", flush=True)
                 if stale >= args.patience:
                     break
             blob = torch.load(ckpt, map_location=device, weights_only=False)
@@ -769,7 +840,8 @@ def main():
                     "inference_ms_sample_batch1": _inference_ms_batch1(
                         model, next(iter(test.values())), stats, rate_scale, device),
                     "inference_scope": "network forward only; excludes preprocessing and solver",
-                    "best_val_mse": best,
+                    "best_val_mse": best_val_mse,
+                    "best_val_objective": best,
                     "one_step_test": evaluate_one_step(model, test, stats, rate_scale, device, args),
                     "autoregressive_test": evaluate_rollout(model, test, stats, rate_scale, device, args)}
             metric_path.write_text(json.dumps(item, indent=2), encoding="utf-8")
