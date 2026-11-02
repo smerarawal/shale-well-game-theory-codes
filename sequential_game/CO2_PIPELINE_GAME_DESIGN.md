@@ -6,20 +6,20 @@ Build a second game alongside the existing water/brine-injection game. It repres
 
 > How do pipeline capacity, reservoir geology, and operator differences shape injection decisions, storage outcomes, and the welfare gap between noncooperative and coordinated policies?
 
-This is a design specification for the eventual game. The current checkout contains a water game, an experimental vertical x–z CO₂/brine reservoir solver, and a CO₂ payoff scaffold. It does not yet contain a pipeline network model or a connected CO₂ game runner. Keep existing water results in their own namespace; do not pool water and CO₂ welfare or surrogate errors.
+This design specification accompanies the CO₂ game environment in `co2_pipeline_game.py` and `co2_well_placement_game.py`. The checkout also contains a water game, an experimental vertical x–z CO₂/brine reservoir solver, and a CO₂ payoff scaffold. It does not yet contain a pipeline network model or a game-theoretic policy/equilibrium runner. Keep existing water results in their own namespace; do not pool water and CO₂ welfare or surrogate errors.
 
 ## Modeling boundary
 
 The model has two coupled physical subsystems:
 
-1. **Pipeline delivery:** CO₂ is made available at one or more sources and transported to injection sites. A pipeline constraint limits the quantity and timing of delivery; transport and compression have resource costs.
+1. **Pipeline delivery:** one common CO₂ supply feeds one shared pipeline-capacity bottleneck serving all operators. The tighter of source availability and pipeline capacity limits total stage delivery. The current game allocates that shared quantity between operators; it does not route flow to individual wellheads.
 2. **Subsurface storage:** delivered CO₂ is injected into a brine-filled formation. Pressure, buoyant migration, plume interaction, dissolution, residual trapping, and possible boundary contact evolve over time. Brine is displaced as CO₂ occupies pore volume.
 
 The first game version should use a transparent, stage-level pipeline capacity and cost abstraction. It should not claim to simulate pipeline hydraulics. Add pressure, temperature, linepack, compressor dynamics, and routing only after the user’s pipeline implementation and units are available. A CO₂ transport model and a geological storage model are separate components of the broader CCS chain; NETL’s cost methodology explicitly treats pipeline rate, distance, elevation, pumps, and diameter as transport factors. [NETL transport and storage cost guidelines](https://netl.doe.gov/projects/files/QualityGuidelinesforEnergySystemStudiesCarbonDioxideTransportandStorageCostsinNETLStudies_073124.pdf)
 
 ## Game class and time
 
-- **Players:** initially two storage operators; make the operator count configurable.
+- **Players:** start with two storage operators for comparison, but keep the operator count configurable. State/action structures must not assume exactly two operators or one well per operator.
 - **Horizon:** six stages for direct comparability with the existing game, but configurable. A stage is a declared operational interval (for example, a 30-day pilot step); this duration is a scenario parameter until calibrated.
 - **Information:** geology and some reservoir parameters are fixed but initially unknown to operators. Operators observe their own actions, delivered quantities, pipeline signals available to them, and noisy monitoring data. The observation model must state which pressure/plume measurements are public, private, or unavailable.
 - **Solution concept:** finite-horizon partially observable stochastic game. The maintained information state is the joint belief over unknown geology/parameters plus the physical state. Nash and cooperative policies are computed approximations; finite-horizon best-response results must not be called a proven exact Markov-perfect Bayesian equilibrium.
@@ -53,7 +53,7 @@ The current x–z pilot has mobile/trapped/dissolved CO₂ and `sg_max`, but no 
 
 **Version 1, stage-level abstraction:**
 
-- available throughput by shared edge or delivery node (mass per stage);
+- one shared throughput limit and one common source-availability limit (mass per stage);
 - exogenous availability/outage flag, if outages are part of the scenario;
 - remaining contracted/source quantity, if supply is limited;
 - cumulative delivered mass and resource cost by operator.
@@ -64,10 +64,25 @@ No within-stage linepack or hydraulic pressure is represented in v1. A capacity 
 
 ### Wells, permits, and accounts
 
-- active wells, well locations/completions, operator ownership, and remaining drill budget;
+- persistent well IDs, site, type, operator ownership, drilling/commissioning stage, last realized rate, cumulative injection by well, and remaining drill budget;
 - shared pipeline capacity already used during the stage if dispatch is sequential;
 - cumulative storage/injection permit used and any operator-specific quota balances;
 - cumulative operator payoffs split into revenue/storage credit, pipeline cost, compression energy, drilling cost, pressure damage, plume/containment damage, and transfers.
+
+### Future well-placement and monitoring decisions
+
+The game must grow beyond a small fixed set of wells. The current transition kernel already permits a variable-size set of grid-cell wells per operator and a `new_wells` action. That is a useful integration hook, but it is only simple cell selection; it is not an optimized, geometry-constrained well-placement model.
+
+For a future Caers-style sequential placement workflow, extend the game while preserving the current shared-supply and shared-pipeline boundary:
+
+- Give every well a stable ID, owner, type (injector or monitor), candidate site or trajectory, drilling/activation stage, completion, last realized rate, and cumulative injected mass. Do not identify a well by its position in an array.
+- Put candidate locations and geometric constraints in a separate placement module: eligible zones, minimum spacing, fault/boundary setbacks, trajectory constraints, site exclusivity, maximum well counts, and drilling budgets. The game validates proposed placements through this module; the reservoir solver receives the resulting well controls.
+- Make placement, drilling/activation, shut-in, and rate control explicit actions. If drilling has a lead time, store planned, under-construction, and active wells separately. Do not silently let a newly selected location inject immediately unless that scenario says so.
+- Let each operator choose only from its private/legal candidate set and control only its own wells. The dispatcher continues to aggregate nominations across operators and allocate the common source/pipeline throughput before reservoir advancement.
+- Add monitoring-well placement and observations as distinct actions only when an observation model is implemented. Store uncertain geology in the belief state; monitoring changes beliefs and can therefore change later placement and injection actions.
+- Keep pipeline dispatch operator-level in the current model. A future network can add site-level routing through a separate adapter without changing the game’s well identities or reservoir state.
+
+This is compatible with the general approach in Wang et al., *Optimizing Carbon Storage Operations for Long-Term Safety*, which formulates sequential injector/monitor placement under geological uncertainty as belief-state planning and uses a flow surrogate to make repeated planning simulations tractable. This prototype does not yet implement that paper's POMDP, monitoring, 3D physics, or surrogate.
 
 ### Hidden parameters and belief `B_t`
 
@@ -79,7 +94,7 @@ Represent only declared external processes, such as source availability, a sampl
 
 ## Actions
 
-At each stage, each operator chooses an action simultaneously from its information set:
+At each stage, each operator chooses an action simultaneously from its information set. The number of operators and each operator's active/candidate well sets are variable:
 
 `a^i_t = (q^i_t, d^i_t, w^i_t, r^i_t, m^i_t)`
 
@@ -87,7 +102,7 @@ where:
 
 - `q_i`: CO₂ delivery nomination or requested mass for the stage;
 - `d_i`: pipeline/capacity bid or priority request if an allocation mechanism is under study;
-- `w_i`: drill/activate/hold action and well site/completion choice;
+- `w_i`: drill/activate/hold action and well site/completion choice; v1 supports adding grid-cell injection wells, while monitoring wells and trajectories are future extensions;
 - `r_i`: requested injection rate schedule across owned active wells;
 - `m_i`: monitoring choice, only if monitoring has a modeled cost and changes observations.
 
@@ -170,7 +185,7 @@ Until this interface is known, use a documented synthetic stage-capacity block f
 
 ### Phase 1 — deterministic plumbing pilot
 
-Use two operators, a single source, one shared edge, a fixed stage delivery cap, no outage, and the current vertical x–z reservoir solver. Fix geology, wells, action grid, and stage duration. Check the conservation identity:
+Use two operators, one common source, one shared-capacity bottleneck, a fixed stage delivery cap, no outage, and the current vertical x–z reservoir solver. Start with a fixed placement set for a controlled baseline, then vary placement and well count as a separate treatment. Fix geology, action grid, and stage duration within each paired comparison. Check the conservation identity:
 
 `source mass = delivered mass + pipeline loss (if modeled) + undelivered/curtailed mass`;
 
@@ -241,16 +256,16 @@ Keep three uncertainty sources separate: (1) physical model and discretization e
 - Water-game baseline: `game3.py`, `run_study7.py`, and `README_STUDY7.md`.
 - CO₂ reservoir pilot: `co2_xz_solver.py`, `test_co2_xz_solver.py`, `generate_co2_xz_pilot.py`, `generate_co2_xz_dataset.py`.
 - CO₂ payoff/geology scaffold: `co2_experiment.py`; it is not wired into `game3.py`.
-- Initial stage transition kernel: `co2_pipeline_game.py`. It implements a single shared stage-capacity abstraction, explicit dispatch (proportional/CEA/CEL/fixed equal), storage-cap curtailment, CO₂ solver calls, operator well ledgers, and separated pipeline resource costs/tariff transfers. It is not yet a pipeline-hydraulics model, belief filter, planner, or equilibrium solver.
+- Initial stage transition kernel: `co2_pipeline_game.py`. It implements a single shared stage-capacity abstraction, explicit dispatch (proportional/CEA/CEL/fixed equal), storage-cap curtailment, CO₂ solver calls, operator well ledgers, and separated pipeline resource costs/tariff transfers.
+- Well-placement game adapter: `co2_well_placement_game.py`. It adds stable well IDs, variable well counts, candidate-site, spacing, per-operator well-count, per-stage drilling, per-well rate, and commissioning-delay constraints. It supports injector and monitor well records; monitor observations require an explicit callback. It is still a transition environment, not a policy planner, equilibrium solver, well-trajectory model, or pipeline-hydraulics model.
 - CO₂ surrogate workflow: `train_co2_xz_surrogate.py` and `CO2_STAGED_RUN.md`; it is separate from the brine trainer.
-- New game integration should introduce a CO₂-specific environment adapter and runner rather than changing the water game’s state keys or reward calculation.
+- Keep CO₂ policy/planner integration in CO₂-specific modules rather than changing the water game’s state keys or reward calculation.
 
 ## Explicit unresolved decisions
 
 These cannot be responsibly fixed from the current repository alone:
 
-1. The actual pipeline topology, physics, controls, and units from the user’s pipeline work.
-2. Whether operators own pipeline capacity, purchase it from a common carrier, or face a regulator-allocated shared limit.
+1. Whether operators own pipeline capacity, purchase it from a common carrier, or face a regulator-allocated shared limit.
 3. Whether brine is only displaced in place or can be produced, treated, and sold/disposed.
 4. The calibrated value of stored CO₂, injection service, transport, compression, pressure damage, plume overlap, and containment risk.
 5. Whether source supply, outages, monitoring, leakage, or post-injection retention are in the first game scope.
