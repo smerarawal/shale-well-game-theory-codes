@@ -120,9 +120,10 @@ class OperatorAction:
 
     ``wells`` contains ``(z_index, x_index, requested_rate_m3_s)`` for every
     active injection well. A single dispatch scaling factor is applied to that
-    operator's rates. ``new_wells`` lists the cells opened during this stage;
-    each must also appear in ``wells``. A future model can replace this action
-    object with discrete rate/site choices without changing the transition API.
+    operator's rates. ``new_wells`` lists cells drilled during this stage. A
+    newly drilled well may remain shut in during its commissioning stage; it
+    does not need a positive rate in ``wells``. A higher-level placement
+    adapter can use stable well IDs and translate them into grid coordinates.
     """
 
     wells: tuple[tuple[int, int, float], ...] = ()
@@ -226,8 +227,11 @@ def _validate_actions(actions: Sequence[OperatorAction], n_operators: int,
             requested_rate[op] += float(rate)
             combined_wells.append((cell[0], cell[1], float(rate)))
         new_cells = [tuple(map(int, cell)) for cell in action.new_wells]
-        if len(set(new_cells)) != len(new_cells) or any(cell not in own_cells for cell in new_cells):
-            raise ValueError("new_wells must be unique cells included in that operator's wells")
+        if len(set(new_cells)) != len(new_cells):
+            raise ValueError("new_wells must contain unique cells")
+        for cell in new_cells:
+            if not (0 <= cell[0] < shape[0] and 0 <= cell[1] < shape[1]):
+                raise ValueError(f"operator {op} placed a well outside the reservoir grid: {cell}")
     return requested_rate, combined_wells
 
 
