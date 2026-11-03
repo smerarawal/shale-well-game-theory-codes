@@ -10,6 +10,68 @@ The central research question is:
 
 The study should combine the six proposed ideas, with equilibrium-aware data generation as the main surrogate contribution.
 
+## Five requested institution and equilibrium experiments
+
+These five handwritten ideas are now represented in the runnable analysis
+layer described in [`CO2_RESEARCH_EXECUTION.md`](CO2_RESEARCH_EXECUTION.md).
+Their first implementation is deliberately a solver-derived, one-stage finite
+action game at a fixed initial reservoir state. It is useful for checking the
+logic, but it is **not** a dynamic Markov-perfect-equilibrium result. A full
+dynamic version must solve state-dependent continuations over pressure,
+plume, remaining pipeline/storage capacity, active wells, and stage.
+
+1. **Correlated equilibrium (CE):** enumerate a finite rate-profile payoff
+   table, then solve a linear program for a mediator's joint lottery over
+   profiles. Obedience constraints use each operator's private payoff. The
+   LP can maximize separately recorded project resource welfare. Compare its
+   expected resource welfare and private payoffs with pure Nash profiles and
+   the project-welfare-maximizing profile. This answers whether a trusted
+   recommendation device can coordinate operators; it does not establish that
+   the recommendation mechanism is deployed or that the physical resource
+   game is completely observed.
+2. **Injection-capacity auction and Weitzman price-vs-quantity check:** build
+   marginal private values from uncapped solver runs, convert equal-size
+   injection increments into capacity blocks, then compare VCG and pay-as-bid
+   allocations under truthful and shaded bids. Separately run an explicitly
+   illustrative stochastic linear-quadratic price-versus-cap calculation.
+   Because reservoir pressure and plume damages create interdependent values,
+   neither the additive private-value VCG benchmark nor the toy Weitzman
+   result is a final CO2 policy recommendation. Compare against the solver's
+   paired cap/tariff sweep after calibration.
+3. **Financial assurance / bonds:** vary each operator's secured bond against
+   solver-attributed physical damages. Private incentives subtract collectible
+   liability and the opportunity cost of tied-up capital; unsecured harm is
+   reported separately. Project resource welfare always subtracts full
+   physical damage once, and bond payments are treated as transfers rather
+   than new social value. The stage-game screen measures whether liability
+   changes equilibrium and safety incentives; it does not yet model default,
+   insolvency, or a real legal rule.
+4. **Horizon and Folk-theorem incentive check:** calculate repeated stationary
+   payoff accounting for selected horizons and discount factors, and compute
+   the one-shot deviation discount threshold under an indefinite-horizon grim
+   trigger with a credible punishment. Keep these as two different outputs.
+   A known finite horizon does not inherit the infinite-horizon Folk theorem;
+   with a unique stage-game Nash equilibrium, backward induction selects Nash
+   in every stage. The full reservoir game needs a state-dependent finite-horizon
+   dynamic program before making dynamic cooperation claims.
+5. **Equilibrium diagnostics and welfare-gap audit:** report all pure Nash
+   profiles on the declared action grid, unilateral deviation gains, minimum
+   regret profile, cycles, and sensitivity to low/high/mid/random starts.
+   Compute the cooperative comparator by maximizing **project resource welfare**,
+   then show its operator payoffs separately. The Coop−Nash gap is a social
+   welfare comparison, not a claim that every operator prefers cooperation.
+   Grid and search diagnostics are approximate; exact equilibrium claims
+   require exhaustive state/action continuation or a verified solver.
+
+The shared-capacity CO2 game also includes paired comparisons of proportional,
+CEA, CEL, fixed-equal rationing and tariffs, plus geology-regime, pressure
+interference/price, surrogate rollout, solver-labeling, and policy-distillation
+studies. These are separate from the five institution experiments above.
+The available scripts create the experiments and output schemas; no new CO2
+results are being claimed until the Kaggle runs finish on reviewed inputs.
+
+The runnable analysis/planning layer is documented in [`CO2_RESEARCH_EXECUTION.md`](CO2_RESEARCH_EXECUTION.md). It adds paired regime-map sweeps, interference and price diagnostics, the five institution/equilibrium experiments above, differentiable surrogate best responses, solver-labelled active-data collection, and decision-tree distillation. These tools remain 2D x-z and scenario-calibrated; a 3D solver is a separate implementation phase.
+
 ## Dimensionality target: build toward 3D
 
 The eventual target is a 3D CO2 game. The current reservoir solver, stage adapter, game state, and SPE10 patch sampler are 2D and square-grid-oriented; they are not a 3D implementation. The existing SPE10 patch path extracts a horizontal x-y layer, so gravity along one of those axes is not the SPE10 vertical direction. Do not describe those current patches as a 3D buoyant-plume experiment.
@@ -209,10 +271,10 @@ Report each metric per geology and per stage, including the final autoregressive
 | Pressure field | RMSE, MAE, max-absolute error, R²; p_max absolute error, signed bias and high percentile; top-decile-pressure RMSE; well-cell RMSE |
 | Phase fields | Brine and mobile-CO₂ saturation RMSE/MAE/max error; plume footprint IoU/F1 at declared saturation cutoffs; plume area/volume and front displacement |
 | CO₂ accounting | Dissolved, mobile, and residual-trapped mass absolute/relative error; total component mass-balance residual; retained-mass error |
-| Safety/payoff | Pressure-cap violation classification and rate; error in the pressure penalty `30 × max(0, p_max − 6)^2` if that cap and calibration are retained; plume overlap and boundary-contact error; payoff error and solver-measured action regret |
+| Safety/payoff | Pressure-cap violation classification and rate; pressure-damage/payoff error using a CO2-specific pressure cap in Pa and reviewed damage coefficient; plume overlap and boundary-contact error; payoff error and solver-measured action regret |
 | Robustness and cost | Metrics by friendly/intermediate/challenging, rough/smooth, Tarbert/Ness, more-well and unseen-slice sets; stage-wise error growth; parameters, peak memory, train time, batch-1 inference time and full planner runtime |
 
-The pressure penalty above is inherited from the current game experiment, not yet calibrated for CO₂. The CO₂ payoff also includes retained storage and plume/containment terms, so report errors in each payoff component and total welfare separately. The supplied five-model OOD p_max range and negative SPE10 bias make pressure-tail, well-cell, and p_max-bias analysis mandatory, not optional.
+Do not carry the water-game pressure penalty `30 × max(0, p_max − 6)^2` into CO2. Define the CO2 pressure cap in Pa and its damage coefficient in reviewed payoff units. The CO₂ payoff also includes retained storage and plume/containment terms, so report errors in each payoff component and total welfare separately. Pressure-tail, well-cell, and p_max-bias analysis remain required.
 
 ## Result and artifact requirements
 

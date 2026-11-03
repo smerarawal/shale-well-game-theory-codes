@@ -100,3 +100,15 @@ Monitor wells can be placed with `WellPlacement(..., well_type="monitor")`. They
 ## Current scope and next layer
 
 This is a Markov-game **environment**, not yet a Nash solver or a Caers-style belief-state planner. `CO2GameConfig` payoff defaults are zero-valued placeholders. Before a planner can make meaningful welfare-maximizing decisions, choose and justify scenario payoff coefficients or a calibrated economic ledger. Then add policy modules that consume each operator's information state and call `game.step`; keep equilibrium search separate from physical transition code. The current CO₂ solver also represents point injectors on a 2D x-z grid and does not model well trajectories, brine production, pipeline network flow, or leakage. Monitoring behavior must be supplied as a caller-defined observation callback.
+
+## Experiment suite
+
+For the new CO₂ work, use [`CO2_RESEARCH_EXECUTION.md`](CO2_RESEARCH_EXECUTION.md)
+for the paired geology/instrument regime map, solver-derived interference and
+price analysis, surrogate/solver planner comparison, and exact Kaggle cells
+for the five institution ideas: correlated equilibrium, capacity auction and
+price-vs-quantity, financial assurance, horizon/Folk incentives, and
+equilibrium/welfare-gap diagnostics. Read [`CO2_STUDY_PLAN.md`](CO2_STUDY_PLAN.md)
+for the physics gates, study design, and 3D roadmap. The initial institution
+experiments use one-stage fixed-well payoff tables as a diagnostic; they are
+not dynamic Markov-perfect equilibrium results.

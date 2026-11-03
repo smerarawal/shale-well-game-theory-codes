@@ -1,0 +1,27 @@
+{
+  "horizon": 1,
+  "stage_duration_s": 2592000,
+  "discount_factor": 0.9523809524,
+  "pipeline": {
+    "capacity_kg_per_stage": 150.0,
+    "source_supply_kg_per_stage": null,
+    "dispatch_rule": "proportional",
+    "resource_cost_per_kg": 0.0,
+    "tariff_per_kg": 0.0
+  },
+  "payoff": {
+    "storage_value_per_kg": 1.0,
+    "drilling_cost_per_well": 0.0,
+    "pressure_cap_pa": 2000000.0,
+    "pressure_damage_per_pa2": 0.0,
+    "plume_overlap_damage": 0.0,
+    "boundary_contact_damage": 0.0
+  },
+  "wells_by_operator": [[12, 7], [12, 16]],
+  "solver": {
+    "dx_ft": 20.0,
+    "dz_ft": 2.0,
+    "dy_ft": 10.0,
+    "max_dt_s": 86400.0
+  }
+}

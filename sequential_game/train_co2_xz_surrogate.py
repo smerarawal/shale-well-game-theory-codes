@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -339,8 +340,11 @@ def _torch_project(state, previous):
 
 def _batch_loss(pred, y_target, state_in, pv, injected, y_std, y_mean,
                 valid_weight, mass_weight, plume_weight=0.0,
-                plume_threshold=0.01, plume_temperature=0.002):
-    """Normalized field loss plus pressure, validity, mass, and plume penalties."""
+                plume_threshold=0.01, plume_temperature=0.002,
+                pmax_weight=0.5, pressure_tail_weight=0.0,
+                pressure_tail_fraction=0.1, pressure_penalty_weight=0.0,
+                pressure_cap_pa=None):
+    """Field loss plus configurable game-pressure and physical penalties."""
     target_norm = (y_target - y_mean) / y_std
     loss_field = F.mse_loss(pred, target_norm)
     delta = pred * y_std + y_mean
@@ -349,6 +353,26 @@ def _batch_loss(pred, y_target, state_in, pv, injected, y_std, y_mean,
     pmax_loss = (F.mse_loss(raw[:, 0].flatten(1).amax(1),
                             target_out[:, 0].flatten(1).amax(1))
                  / (y_std[0, 0, 0, 0].square() + 1e-12))
+    pressure_tail_loss = pred.new_zeros(())
+    pressure_penalty_loss = pred.new_zeros(())
+    if pressure_tail_weight > 0:
+        flat_p = raw[:, 0].flatten(1)
+        flat_t = target_out[:, 0].flatten(1)
+        count = max(1, int(math.ceil(flat_t.shape[1] * pressure_tail_fraction)))
+        threshold = flat_t.topk(count, dim=1).values[:, -1:]
+        mask = flat_t >= threshold
+        scale2 = y_std[0, 0, 0, 0].square() + 1e-12
+        pressure_tail_loss = (((flat_p - flat_t).square() * mask).sum(1)
+                              / mask.sum(1).clamp_min(1) / scale2).mean()
+    if pressure_penalty_weight > 0:
+        if pressure_cap_pa is None or pressure_cap_pa <= 0:
+            raise ValueError("pressure penalty loss requires a positive --pressure-cap-pa")
+        pmax_pred = raw[:, 0].flatten(1).amax(1)
+        pmax_true = target_out[:, 0].flatten(1).amax(1)
+        scale = torch.clamp_min(y_std[0, 0, 0, 0], max(float(pressure_cap_pa), 1.0))
+        exceed_pred = F.relu(pmax_pred - pressure_cap_pa) / scale
+        exceed_true = F.relu(pmax_true - pressure_cap_pa) / scale
+        pressure_penalty_loss = F.mse_loss(exceed_pred.square(), exceed_true.square())
     sm, st, smx, cd = raw[:, 1], raw[:, 2], raw[:, 3], raw[:, 4]
     valid = (F.relu(-sm).square().mean()
              + F.relu(state_in[:, 2] - st).square().mean()
@@ -372,8 +396,11 @@ def _batch_loss(pred, y_target, state_in, pv, injected, y_std, y_mean,
     plume_dice = 1.0 - ((2.0 * intersection + 1e-6) /
                         (plume_prob.sum((1, 2)) + plume_target.sum((1, 2)) + 1e-6))
     plume_loss = plume_dice.mean()
-    return (loss_field + 0.5 * pmax_loss + valid_weight * valid
-            + mass_weight * mass + plume_weight * plume_loss)
+    return (loss_field + pmax_weight * pmax_loss
+            + pressure_tail_weight * pressure_tail_loss
+            + pressure_penalty_weight * pressure_penalty_loss
+            + valid_weight * valid + mass_weight * mass
+            + plume_weight * plume_loss)
 
 
 def _train_pushforward_epoch(model, optimizer, windows, sequence_data,
@@ -406,7 +433,12 @@ def _train_pushforward_epoch(model, optimizer, windows, sequence_data,
                 y_std, y_mean, args.valid_loss_weight, args.mass_loss_weight,
                 getattr(args, "plume_loss_weight", 0.0),
                 getattr(args, "plume_threshold", 0.01),
-                getattr(args, "plume_temperature", 0.002)))
+                getattr(args, "plume_temperature", 0.002),
+                getattr(args, "pmax_loss_weight", 0.5),
+                getattr(args, "pressure_tail_loss_weight", 0.0),
+                getattr(args, "pressure_tail_fraction", 0.1),
+                getattr(args, "pressure_penalty_loss_weight", 0.0),
+                getattr(args, "pressure_cap_pa", None)))
             raw_out = state_in + pred * y_std + y_mean
             dynamic = _torch_project(raw_out, state_in).detach().cpu().numpy()
         loss = torch.stack(losses).mean()
@@ -465,6 +497,26 @@ def score_states(pred, truth, data, args):
     out["pmax_abs_mean_pa"] = float(np.mean(np.abs(pmax_e)))
     out["pmax_bias_pa"] = float(np.mean(pmax_e))
     out["pmax_abs_p95_pa"] = float(np.percentile(np.abs(pmax_e), 95))
+    pressure_cap = getattr(args, "pressure_cap_pa", None)
+    pressure_damage = getattr(args, "pressure_damage_per_pa2", None)
+    if pressure_cap is not None:
+        true_max = ptrue.reshape(len(ptrue), -1).max(1)
+        pred_max = ppred.reshape(len(ppred), -1).max(1)
+        true_violation = true_max > pressure_cap
+        pred_violation = pred_max > pressure_cap
+        out["pressure_cap_pa"] = float(pressure_cap)
+        out["pressure_cap_violation_true_fraction"] = float(np.mean(true_violation))
+        out["pressure_cap_violation_pred_fraction"] = float(np.mean(pred_violation))
+        out["pressure_cap_violation_classification_error"] = float(
+            np.mean(true_violation != pred_violation))
+        out["pressure_cap_exceedance_abs_error_mean_pa"] = float(np.mean(np.abs(
+            np.maximum(pred_max - pressure_cap, 0.0)
+            - np.maximum(true_max - pressure_cap, 0.0))))
+        if pressure_damage is not None:
+            true_penalty = pressure_damage * np.maximum(true_max - pressure_cap, 0.0) ** 2
+            pred_penalty = pressure_damage * np.maximum(pred_max - pressure_cap, 0.0) ** 2
+            out["pressure_penalty_abs_error_mean"] = float(np.mean(np.abs(pred_penalty - true_penalty)))
+            out["pressure_penalty_bias"] = float(np.mean(pred_penalty - true_penalty))
     top_errors, well_errors, plume_iou, plume_fraction = [], [], [], []
     plume_thresholds = (0.005, 0.01, 0.02)
     threshold_ious = {threshold: [] for threshold in plume_thresholds}
@@ -642,12 +694,28 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--width", type=int, default=32)
     ap.add_argument("--learning-rate", type=float, default=8e-4)
+    ap.add_argument("--pmax-loss-weight", type=float, default=0.5,
+                    help="weight for normalized max-pressure regression")
+    ap.add_argument("--pressure-tail-loss-weight", type=float, default=0.0,
+                    help="weight for pressure error on target top-tail cells")
+    ap.add_argument("--pressure-tail-fraction", type=float, default=0.1,
+                    help="fraction of highest target-pressure cells used for tail loss")
+    ap.add_argument("--pressure-penalty-loss-weight", type=float, default=0.0,
+                    help="weight for matching pressure-cap exceedance-squared penalty")
+    ap.add_argument("--pressure-cap-pa", type=float, default=None,
+                    help="expert-reviewed game pressure cap in Pa")
+    ap.add_argument("--pressure-damage-per-pa2", type=float, default=None,
+                    help="damage coefficient used to report payoff-scale pressure penalty error")
     ap.add_argument("--mass-loss-weight", type=float, default=0.0,
                     help="soft stage mass-balance loss weight; zero preserves baseline training")
     ap.add_argument("--valid-loss-weight", type=float, default=0.0,
                     help="penalize raw invalid saturation/trapping/dissolution outputs before clipping")
     ap.add_argument("--rollout-unroll", type=int, choices=[1, 3, 6], default=1,
                     help="independent transitions or 3-/6-stage pushforward windows")
+    ap.add_argument("--rollout-validation-weight", type=float, default=0.0,
+                    help="weight for normalized six-stage validation rollout score in checkpoint selection")
+    ap.add_argument("--rollout-validation-every", type=int, default=5,
+                    help="evaluate validation rollouts every N epochs when rollout weight is nonzero")
     ap.add_argument("--plume-loss-weight", type=float, default=0.0,
                     help="soft-Dice weight for the mobile-CO2 plume mask")
     ap.add_argument("--plume-threshold", type=float, default=0.01,
@@ -659,6 +727,17 @@ def main():
     ap.add_argument("--stage-days", type=float, default=30.0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+    if not 0.0 < args.pressure_tail_fraction <= 1.0:
+        raise ValueError("--pressure-tail-fraction must be in (0, 1]")
+    if args.pressure_penalty_loss_weight > 0 and not args.pressure_cap_pa:
+        raise ValueError("--pressure-penalty-loss-weight requires --pressure-cap-pa")
+    if args.pressure_damage_per_pa2 is not None and not args.pressure_cap_pa:
+        raise ValueError("--pressure-damage-per-pa2 requires --pressure-cap-pa")
+    if min(args.pmax_loss_weight, args.pressure_tail_loss_weight,
+           args.pressure_penalty_loss_weight, args.rollout_validation_weight) < 0:
+        raise ValueError("pressure loss weights must be nonnegative")
+    if args.rollout_validation_every < 1:
+        raise ValueError("--rollout-validation-every must be >= 1")
     data_dir, out_dir = Path(args.data_dir), Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     train = {c: load_cohort(data_dir, "train", c) for c in COHORTS}
@@ -744,7 +823,12 @@ def main():
                                            injected, y_std_t, y_mean_t,
                                            args.valid_loss_weight, args.mass_loss_weight,
                                            args.plume_loss_weight, args.plume_threshold,
-                                           args.plume_temperature)
+                                           args.plume_temperature,
+                                           args.pmax_loss_weight,
+                                           args.pressure_tail_loss_weight,
+                                           args.pressure_tail_fraction,
+                                           args.pressure_penalty_loss_weight,
+                                           args.pressure_cap_pa)
                         n_items = len(ids)
                     else:
                         seq = batch_ids
@@ -772,7 +856,12 @@ def main():
                                 pred, target_delta, state_in, pv, injected,
                                 y_std_t, y_mean_t, args.valid_loss_weight,
                                 args.mass_loss_weight, args.plume_loss_weight,
-                                args.plume_threshold, args.plume_temperature))
+                                args.plume_threshold, args.plume_temperature,
+                                args.pmax_loss_weight,
+                                args.pressure_tail_loss_weight,
+                                args.pressure_tail_fraction,
+                                args.pressure_penalty_loss_weight,
+                                args.pressure_cap_pa))
                             # Push forward but detach state at each stage to
                             # bound memory use during the rollout unroll.
                             raw_out = state_in + pred * y_std_t + y_mean_t
@@ -784,6 +873,8 @@ def main():
                     run += float(loss.detach()) * n_items
                 model.eval(); val_loss = 0.0; val_n = 0
                 val_plume_sum = 0.0; val_plume_n = 0
+                val_pmax_sum = 0.0; val_tail_sum = 0.0; val_penalty_sum = 0.0
+                val_case_n = 0
                 y_std_t = torch.as_tensor(stats["y_std"], device=device)
                 y_mean_t = torch.as_tensor(stats["y_mean"], device=device)
                 with torch.no_grad():
@@ -801,10 +892,30 @@ def main():
                             val_loss += float(F.mse_loss(pred_norm, target_norm,
                                                          reduction="sum"))
                             val_n += target_norm.numel()
+                            state_in = state_in_all[sl]
+                            pred_out = state_in + pred_norm * y_std_t + y_mean_t
+                            target_out = state_in + target_norm * y_std_t + y_mean_t
+                            pred_p = pred_out[:, 0].flatten(1)
+                            true_p = target_out[:, 0].flatten(1)
+                            pscale2 = y_std_t[0, 0, 0, 0].square() + 1e-12
+                            val_pmax_sum += float(F.mse_loss(
+                                pred_p.amax(1), true_p.amax(1), reduction="sum") / pscale2)
+                            tail_count = max(1, int(math.ceil(
+                                true_p.shape[1] * args.pressure_tail_fraction)))
+                            tail_threshold = true_p.topk(tail_count, dim=1).values[:, -1:]
+                            tail_mask = true_p >= tail_threshold
+                            tail_per_case = (((pred_p - true_p).square() * tail_mask).sum(1)
+                                             / tail_mask.sum(1).clamp_min(1) / pscale2)
+                            val_tail_sum += float(tail_per_case.sum())
+                            if args.pressure_cap_pa is not None:
+                                scale = torch.clamp_min(
+                                    y_std_t[0, 0, 0, 0], max(float(args.pressure_cap_pa), 1.0))
+                                pred_excess = F.relu(pred_p.amax(1) - args.pressure_cap_pa) / scale
+                                true_excess = F.relu(true_p.amax(1) - args.pressure_cap_pa) / scale
+                                val_penalty_sum += float(F.mse_loss(
+                                    pred_excess.square(), true_excess.square(), reduction="sum"))
+                            val_case_n += len(pred_p)
                             if args.plume_loss_weight > 0:
-                                state_in = state_in_all[sl]
-                                pred_out = state_in + pred_norm * y_std_t + y_mean_t
-                                target_out = state_in + target_norm * y_std_t + y_mean_t
                                 pred_prob = torch.sigmoid(
                                     (pred_out[:, 1] - args.plume_threshold)
                                     / max(args.plume_temperature, 1e-6))
@@ -817,19 +928,50 @@ def main():
                                 val_plume_n += len(dice)
                 val_mse = val_loss / max(val_n, 1)
                 val_plume_dice_loss = val_plume_sum / max(val_plume_n, 1)
-                score = val_mse + args.plume_loss_weight * val_plume_dice_loss
-                if score < best:
+                val_pmax_loss = val_pmax_sum / max(val_case_n, 1)
+                val_pressure_tail_loss = val_tail_sum / max(val_case_n, 1)
+                val_pressure_penalty_loss = val_penalty_sum / max(val_case_n, 1)
+                score = (val_mse + args.pmax_loss_weight * val_pmax_loss
+                         + args.pressure_tail_loss_weight * val_pressure_tail_loss
+                         + args.pressure_penalty_loss_weight * val_pressure_penalty_loss
+                         + args.plume_loss_weight * val_plume_dice_loss)
+                rollout_score = None
+                rollout_check = (args.rollout_validation_weight > 0 and
+                                 (epoch == 1 or epoch % args.rollout_validation_every == 0
+                                  or epoch == args.epochs))
+                if rollout_check:
+                    rollout_results = evaluate_rollout(
+                        model, val, stats, rate_scale, device, args)
+                    channel_scales = np.asarray(stats["y_std"]).reshape(-1)
+                    cohort_scores = []
+                    for result in rollout_results.values():
+                        if "p_pa_rmse" not in result:
+                            continue
+                        field_score = np.mean([
+                            result[f"{key}_rmse"] / max(float(channel_scales[i]), 1e-12)
+                            for i, key in enumerate(STATE_KEYS)])
+                        pmax_score = result["pmax_abs_mean_pa"] / max(float(channel_scales[0]), 1e-12)
+                        cohort_scores.append(float(field_score + pmax_score))
+                    if cohort_scores:
+                        rollout_score = float(np.mean(cohort_scores))
+                        score += args.rollout_validation_weight * rollout_score
+                select_this_epoch = args.rollout_validation_weight == 0 or rollout_check
+                if select_this_epoch and score < best:
                     best, best_val_mse, best_epoch, stale = score, val_mse, epoch, 0
                     torch.save({"state_dict": model.state_dict(), "backbone": backbone,
                                 "width": args.width, "seed": seed, "params": params,
                                 "rate_scale": rate_scale,
                                 "stats": {k: v.tolist() for k, v in stats.items()},
                                 "args": vars(args)}, ckpt)
-                else:
+                elif select_this_epoch:
                     stale += 1
                 if epoch == 1 or epoch % 5 == 0:
                     print(f"{backbone} seed {seed} epoch {epoch}: train={run/len(X):.5f} "
-                          f"val_mse={val_mse:.5f} val_objective={score:.5f} "
+                          f"val_mse={val_mse:.5f} val_pmax={val_pmax_loss:.5f} "
+                          f"val_tail={val_pressure_tail_loss:.5f} "
+                          f"val_penalty={val_pressure_penalty_loss:.5f} "
+                          f"val_rollout={rollout_score if rollout_score is not None else float('nan'):.5f} "
+                          f"val_objective={score:.5f} "
                           f"best={best:.5f} ({best_epoch})", flush=True)
                 if stale >= args.patience:
                     break
