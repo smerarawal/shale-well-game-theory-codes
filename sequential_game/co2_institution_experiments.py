@@ -177,8 +177,9 @@ def allocate_capacity_auction(
     Each row is an operator's ordered marginal value/bid schedule. The
     allocation search chooses a prefix length for each operator, so block 2
     cannot be won without block 1 even if the supplied marginal schedule is
-    nonmonotone. VCG payments use Clarke-pivot externalities; pay-as-bid is a
-    comparison.
+    nonmonotone. Equal-score allocations first prefer fewer zero-value blocks,
+    then the allocation with the most balanced block counts. VCG payments use
+    Clarke-pivot externalities; pay-as-bid is a comparison.
     """
     values = np.asarray(true_marginal_values, dtype=np.float64)
     bid_array = np.asarray(bids, dtype=np.float64)
@@ -197,6 +198,11 @@ def allocate_capacity_auction(
         players = [i for i in range(n_ops) if i != exclude]
         best_counts = tuple(0 for _ in range(n_ops))
         best_score = 0.0
+
+        def balance_penalty(counts: Sequence[int]) -> float:
+            average = sum(counts) / max(len(counts), 1)
+            return float(sum((count - average) ** 2 for count in counts))
+
         for partial in itertools.product(*(range(n_blocks + 1) for _ in players)):
             if sum(partial) > capacity_blocks:
                 continue
@@ -211,8 +217,12 @@ def allocate_capacity_auction(
                 continue
             score = sum(float(np.sum(bid_array[player, :count]))
                         for player, count in enumerate(counts))
+            tied_score = abs(score - best_score) <= 1e-12
+            fewer_blocks = sum(counts) < sum(best_counts)
+            equally_few_blocks = sum(counts) == sum(best_counts)
+            more_balanced = balance_penalty(counts) < balance_penalty(best_counts) - 1e-12
             if score > best_score + 1e-12 or (
-                    abs(score - best_score) <= 1e-12 and sum(counts) < sum(best_counts)):
+                    tied_score and (fewer_blocks or (equally_few_blocks and more_balanced))):
                 best_counts, best_score = tuple(counts), score
         return best_counts, best_score
 
@@ -255,6 +265,7 @@ def allocate_capacity_auction(
         "social_welfare_under_additive_private_value_assumption": true_welfare,
         "winners": winners,
         "reserve_bid": float(reserve_bid),
+        "tie_break_rule": "maximize reported bid sum; on ties prefer fewer blocks, then balance counts across operators",
         "caveat": (
             "single-stage additive-value auction; VCG efficiency/truthfulness needs the stated "
             "private-value assumptions and does not model reservoir externalities by itself"
