@@ -8,6 +8,30 @@ The game environment is split into a pipeline/reservoir transition and a well-pl
 
 The pipeline layer is deliberately a single shared bottleneck. Total mass available in a stage is `min(source_supply_kg_per_stage, capacity_kg_per_stage)`. This does not represent pipe routes, pressure, linepack, or compressor dynamics.
 
+## Kaggle setup
+
+For this transition-environment pilot, use **CPU**; the reference reservoir solver uses NumPy/SciPy and does not use CUDA. No CO₂ dataset or checkpoint is needed for the synthetic plumbing example below. Turn Kaggle Internet on if you clone from GitHub.
+
+Run this as the first notebook cell:
+
+```python
+from pathlib import Path
+import subprocess
+import sys
+
+REPO = Path("/kaggle/working/shale-well-game-theory-codes")
+if not REPO.exists():
+    subprocess.run([
+        "git", "clone", "--depth", "1",
+        "--branch", "codex/ccs-lstm-fno-variants",
+        "https://github.com/smerarawal/shale-well-game-theory-codes.git",
+        str(REPO),
+    ], check=True)
+sys.path.insert(0, str(REPO))
+```
+
+Then run the “Minimal stage interaction” code in a second cell. It advances **one 30-day stage** and returns `state` plus `stage_record`. To continue the game, call `game.step(...)` again with the returned state and the next simultaneous decisions. For an offline Kaggle session, add a ZIP of the feature branch as a notebook input and extract it under `/kaggle/working` instead of cloning.
+
 ## Minimal stage interaction
 
 ```python
@@ -28,8 +52,8 @@ config = CO2GameConfig(
     n_operators=2,
     horizon=6,
     pipeline=PipelineConfig(
-        source_supply_kg_per_stage=250_000.0,
-        capacity_kg_per_stage=300_000.0,
+        source_supply_kg_per_stage=1_200.0,
+        capacity_kg_per_stage=1_000.0,
         dispatch_rule="proportional",
     ),
 )
@@ -41,7 +65,7 @@ rules = PlacementRules(
     min_spacing_ft=80.0,
     max_wells_per_operator=3,
     max_new_wells_per_operator_per_stage=1,
-    max_rate_m3_s_per_well=1.0e-4,
+    max_rate_m3_s_per_well=1.0e-6,
     drilling_lead_stages=0,
 )
 game = CO2WellPlacementGame(solver=solver, config=config, placement_rules=rules)
@@ -55,17 +79,19 @@ geology = {
 joint_decision = (
     OperatorDecision(
         placements=(WellPlacement("op0-inj0", 5, 2),),
-        rates=(WellRate("op0-inj0", 1.0e-4),),
+        rates=(WellRate("op0-inj0", 1.0e-6),),
     ),
     OperatorDecision(
         placements=(WellPlacement("op1-inj0", 5, 9),),
-        rates=(WellRate("op1-inj0", 1.0e-4),),
+        rates=(WellRate("op1-inj0", 1.0e-6),),
     ),
 )
 state, stage_record = game.step(state, geology, joint_decision)
 ```
 
 Operators act simultaneously: pass one `OperatorDecision` per operator, in the same order as `n_operators`. Each stage record contains nominations, allocations, curtailment, per-well requested/realized rate, placement and commissioning information, reservoir diagnostics, and payoff components. A zero rate shuts in a commissioned injector; omitting a well from the rate list also means it does not inject that stage.
+
+In this tiny plumbing example, the two requests total about 3,370 kg for the 30-day stage, but the shared pipe can carry only 1,000 kg. Proportional dispatch should therefore deliver about 500 kg per operator. These numbers are chosen to demonstrate the code path safely; they are not calibrated engineering or economic values.
 
 ## Monitoring and beliefs
 
