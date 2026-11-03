@@ -173,7 +173,7 @@ def iterated_best_responses(
     pressure_cap_pa: float, pressure_damage_per_pa2: float,
     pressure_smoothing_pa: float = 5e4,
     pipeline_capacity_kg_per_stage: float | None = None,
-    discount_factor: float = 1 / 1.05, rounds: int = 4,
+    discount_factor: float = 1.0, rounds: int = 4,
     steps_per_response: int = 100, learning_rate: float = 0.08,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> dict[str, Any]:
@@ -260,8 +260,11 @@ def main() -> None:
     ap.add_argument("--episode-id", type=int)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--horizon", type=int, default=6)
     ap.add_argument("--rate-max-m3-s", type=float, required=True)
     ap.add_argument("--stage-days", type=float, default=30.0)
+    ap.add_argument("--discount-factor", type=float, default=1.0,
+                    help="per-stage factor; set from the reviewed scenario")
     ap.add_argument("--pressure-cap-pa", type=float, required=True)
     ap.add_argument("--pressure-damage-per-pa2", type=float, required=True)
     ap.add_argument("--storage-value-per-kg", type=float, default=1.0)
@@ -283,7 +286,8 @@ def main() -> None:
                               args.geology_seed, args.episode_id)
     result = iterated_best_responses(
         model, data, row, stats, float(blob["rate_scale"]), rate_max_m3_s=args.rate_max_m3_s,
-        stage_days=args.stage_days, pressure_cap_pa=args.pressure_cap_pa,
+        horizon=args.horizon, stage_days=args.stage_days,
+        discount_factor=args.discount_factor, pressure_cap_pa=args.pressure_cap_pa,
         pressure_damage_per_pa2=args.pressure_damage_per_pa2,
         storage_value_per_kg=args.storage_value_per_kg,
         pipeline_cost_per_kg=args.pipeline_cost_per_kg,
@@ -298,6 +302,8 @@ def main() -> None:
                    "geology_seed": args.geology_seed,
                    "episode_id": args.episode_id, "checkpoint": str(args.checkpoint),
                    "assumptions": {"stage_days": args.stage_days,
+                                   "horizon": args.horizon,
+                                   "discount_factor_per_stage": args.discount_factor,
                                    "pressure_cap_pa": args.pressure_cap_pa,
                                    "pressure_damage_per_pa2": args.pressure_damage_per_pa2,
                                    "storage_value_per_kg": args.storage_value_per_kg,

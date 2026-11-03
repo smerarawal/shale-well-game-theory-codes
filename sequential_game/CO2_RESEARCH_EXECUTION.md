@@ -366,6 +366,7 @@ subprocess.run([
     sys.executable, str(REPO / "sequential_game" / "co2_differentiable_game.py"),
     "--data-dir", str(DATA), "--checkpoint", "/kaggle/input/<model>/co2_ccs_s0.pt",
     "--cohort", "challenging", "--geology-seed", "<training-seed>",
+    "--horizon", "6", "--stage-days", "30", "--discount-factor", "1.0",
     "--rate-max-m3-s", "<reviewed-rate>", "--pressure-cap-pa", "<reviewed-cap-pa>",
     "--pressure-damage-per-pa2", "<reviewed-coefficient>", "--out", str(PLAN)
 ], check=True)

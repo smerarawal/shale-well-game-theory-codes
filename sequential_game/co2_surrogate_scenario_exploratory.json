@@ -1,0 +1,49 @@
+{
+  "scenario_name": "co2_xz_six_stage_exploratory_base_v1",
+  "status": "exploratory_normalized_payoffs_not_field_calibrated",
+  "payoff_units": "normalized utility units; not currency",
+  "horizon": 6,
+  "stage_duration_s": 2592000.0,
+  "discount_factor": 1.0,
+  "rate_max_m3_s": 1e-7,
+  "pipeline": {
+    "capacity_kg_per_stage": 252.72,
+    "source_supply_kg_per_stage": null,
+    "dispatch_rule": "proportional",
+    "resource_cost_per_kg": 0.0,
+    "tariff_per_kg": 0.0
+  },
+  "storage_cap_kg": null,
+  "storage_dispatch_rule": "proportional",
+  "payoff": {
+    "storage_value_per_kg": 1.0,
+    "drilling_cost_per_well": 0.0,
+    "pressure_cap_pa": 5000000.0,
+    "pressure_damage_per_pa2": 1e-13,
+    "plume_overlap_damage": 0.0,
+    "boundary_contact_damage": 0.0
+  },
+  "wells_by_operator": [[22, 8], [22, 16]],
+  "solver": {
+    "dx_ft": 50.0,
+    "dy_ft": 10.0,
+    "dz_ft": 4.1666666667,
+    "mu_brine_pa_s": 0.001,
+    "mu_co2_pa_s": 0.00006,
+    "rho_brine_kg_m3": 1030.0,
+    "rho_co2_kg_m3": 650.0,
+    "gravity_m_s2": 9.81,
+    "total_compressibility_pa_inv": 1e-9,
+    "swc": 0.15,
+    "krw_endpoint": 1.0,
+    "krg_endpoint": 1.0,
+    "corey_brine_exp": 2.0,
+    "corey_co2_exp": 2.0,
+    "land_coefficient": 2.0,
+    "solubility_kg_m3_brine": 30.0,
+    "dissolution_rate_s_inv": 2e-7,
+    "transport_cfl": 0.35,
+    "max_dt_s": 86400.0,
+    "max_steps": 20000
+  }
+}
