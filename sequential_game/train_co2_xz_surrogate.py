@@ -14,6 +14,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import time
 from pathlib import Path
@@ -250,12 +251,44 @@ class UFNO(nn.Module):
         return self.fuse(torch.cat((self.global_path(x), self.local_path(x)), 1))
 
 
+class _ExtensionModelAdapter(nn.Module):
+    """Adapt the CO2-only multi-branch models to this trainer's normalized X -> delta API."""
+    def __init__(self, name, width, cin, cout):
+        super().__init__()
+        from co2_architecture_extensions import CompactUNet2D, FourierMIONet2D
+
+        if cin != 14 or cout != len(STATE_KEYS):
+            raise ValueError(f"{name} expects the 14-channel CO2 trainer input and 5 state deltas")
+        # Geology/metadata fields are Kx, Kz, porosity, well-rate maps, coordinates,
+        # and cell dimensions. The five dynamic state fields occupy channels 3:8.
+        n_geo = 9
+        if name == "compact_unet":
+            self.net = CompactUNet2D(n_geo, cout, 2, width=width, residual=False)
+        elif name == "fourier_mionet":
+            self.net = FourierMIONet2D(n_geo, cout, 2, width=width,
+                                       modes_z=6, modes_x=6,
+                                       n_operator_blocks=2, residual=False)
+        else:
+            raise ValueError(name)
+
+    def forward(self, x):
+        geology = torch.cat((x[:, :3], x[:, 8:]), dim=1)
+        state = x[:, 3:8]
+        # The dataset's two wells are fixed in space; their normalized rate maps
+        # carry placement and their spatial mean supplies the multi-input controls.
+        controls = x[:, 8:10].mean(dim=(-2, -1))
+        return self.net(geology, state, controls)
+
+
 def make_model(name, width, cin=14, cout=len(STATE_KEYS)):
     makers = {"unet": UNet, "ccs": CCSNet, "gnn": GridGNN,
               "fno": FNO, "ufno": UFNO, "ccs_gnn": CCSGNN,
-              "ccs_lstm": CCSConvLSTM, "gnn_lstm": GNNConvLSTM}
+              "ccs_lstm": CCSConvLSTM, "gnn_lstm": GNNConvLSTM,
+              "compact_unet": None, "fourier_mionet": None}
     if name not in makers:
         raise ValueError(f"unknown backbone {name}")
+    if name in ("compact_unet", "fourier_mionet"):
+        return _ExtensionModelAdapter(name, width, cin, cout)
     return makers[name](cin, width, cout)
 
 
@@ -339,7 +372,8 @@ def _torch_project(state, previous):
 
 def _batch_loss(pred, y_target, state_in, pv, injected, y_std, y_mean,
                 valid_weight, mass_weight, plume_weight=0.0,
-                plume_threshold=0.01, plume_temperature=0.002):
+                plume_threshold=0.01, plume_temperature=0.002,
+                pressure_tail_weight=0.0, pressure_tail_threshold_pa=None):
     """Normalized field loss plus pressure, validity, mass, and plume penalties."""
     target_norm = (y_target - y_mean) / y_std
     loss_field = F.mse_loss(pred, target_norm)
@@ -372,8 +406,16 @@ def _batch_loss(pred, y_target, state_in, pv, injected, y_std, y_mean,
     plume_dice = 1.0 - ((2.0 * intersection + 1e-6) /
                         (plume_prob.sum((1, 2)) + plume_target.sum((1, 2)) + 1e-6))
     plume_loss = plume_dice.mean()
+    pressure_tail_loss = pred.new_zeros(())
+    if pressure_tail_weight > 0:
+        if pressure_tail_threshold_pa is None:
+            raise ValueError("pressure tail loss requires a train-derived pressure threshold")
+        tail = target_out[:, 0] >= pressure_tail_threshold_pa
+        pressure_error = (raw[:, 0] - target_out[:, 0]) / y_std[0, 0, 0, 0].clamp_min(1e-12)
+        pressure_tail_loss = (pressure_error.square() * tail).sum() / tail.sum().clamp_min(1)
     return (loss_field + 0.5 * pmax_loss + valid_weight * valid
-            + mass_weight * mass + plume_weight * plume_loss)
+            + mass_weight * mass + plume_weight * plume_loss
+            + pressure_tail_weight * pressure_tail_loss)
 
 
 def _train_pushforward_epoch(model, optimizer, windows, sequence_data,
@@ -406,7 +448,9 @@ def _train_pushforward_epoch(model, optimizer, windows, sequence_data,
                 y_std, y_mean, args.valid_loss_weight, args.mass_loss_weight,
                 getattr(args, "plume_loss_weight", 0.0),
                 getattr(args, "plume_threshold", 0.01),
-                getattr(args, "plume_temperature", 0.002)))
+                getattr(args, "plume_temperature", 0.002),
+                getattr(args, "pressure_tail_weight", 0.0),
+                getattr(args, "pressure_tail_threshold_pa", None)))
             raw_out = state_in + pred * y_std + y_mean
             dynamic = _torch_project(raw_out, state_in).detach().cpu().numpy()
         loss = torch.stack(losses).mean()
@@ -635,7 +679,8 @@ def main():
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--backbones", nargs="+", default=["unet", "ccs", "gnn", "fno", "ufno"],
-                    choices=["unet", "ccs", "gnn", "fno", "ufno", "ccs_gnn", "ccs_lstm", "gnn_lstm"])
+                    choices=["unet", "ccs", "gnn", "fno", "ufno", "ccs_gnn", "ccs_lstm", "gnn_lstm",
+                             "compact_unet", "fourier_mionet"])
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--patience", type=int, default=10)
@@ -654,6 +699,10 @@ def main():
                     help="mobile gas saturation cutoff defining plume cells")
     ap.add_argument("--plume-temperature", type=float, default=0.002,
                     help="soft threshold width for the differentiable plume mask")
+    ap.add_argument("--pressure-tail-weight", type=float, default=0.0,
+                    help="extra normalized pressure loss on cells above a train-derived threshold")
+    ap.add_argument("--pressure-tail-quantile", type=float, default=0.90,
+                    help="train-only absolute-pressure quantile used by pressure-tail loss")
     ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
                     help="reuse completed seed checkpoints and metrics already in the output folder")
     ap.add_argument("--stage-days", type=float, default=30.0)
@@ -699,6 +748,16 @@ def main():
     X = ((x_train - stats["x_mean"]) / stats["x_std"]).astype(np.float32)
     Y = ((y_train - stats["y_mean"]) / stats["y_std"]).astype(np.float32)
     p_in = np.concatenate([d["p_pa_in"] for d in train.values()])
+    p_out_train = np.concatenate([d["p_pa_out"] for d in train.values()])
+    if not 0.0 < args.pressure_tail_quantile < 1.0:
+        raise ValueError("--pressure-tail-quantile must be strictly between 0 and 1")
+    args.pressure_tail_threshold_pa = float(np.quantile(
+        p_out_train, args.pressure_tail_quantile
+    ))
+    if args.pressure_tail_weight > 0:
+        print(f"Train-only pressure-tail threshold: "
+              f"{args.pressure_tail_threshold_pa:.6g} Pa "
+              f"(quantile {args.pressure_tail_quantile:g})", flush=True)
     best_metrics = []
     device = torch.device(args.device)
     for backbone in args.backbones:
@@ -744,7 +803,9 @@ def main():
                                            injected, y_std_t, y_mean_t,
                                            args.valid_loss_weight, args.mass_loss_weight,
                                            args.plume_loss_weight, args.plume_threshold,
-                                           args.plume_temperature)
+                                           args.plume_temperature,
+                                           args.pressure_tail_weight,
+                                           args.pressure_tail_threshold_pa)
                         n_items = len(ids)
                     else:
                         seq = batch_ids
@@ -772,7 +833,9 @@ def main():
                                 pred, target_delta, state_in, pv, injected,
                                 y_std_t, y_mean_t, args.valid_loss_weight,
                                 args.mass_loss_weight, args.plume_loss_weight,
-                                args.plume_threshold, args.plume_temperature))
+                                args.plume_threshold, args.plume_temperature,
+                                args.pressure_tail_weight,
+                                args.pressure_tail_threshold_pa))
                             # Push forward but detach state at each stage to
                             # bound memory use during the rollout unroll.
                             raw_out = state_in + pred * y_std_t + y_mean_t
@@ -784,6 +847,7 @@ def main():
                     run += float(loss.detach()) * n_items
                 model.eval(); val_loss = 0.0; val_n = 0
                 val_plume_sum = 0.0; val_plume_n = 0
+                val_tail_sq = 0.0; val_tail_n = 0
                 y_std_t = torch.as_tensor(stats["y_std"], device=device)
                 y_mean_t = torch.as_tensor(stats["y_mean"], device=device)
                 with torch.no_grad():
@@ -801,6 +865,14 @@ def main():
                             val_loss += float(F.mse_loss(pred_norm, target_norm,
                                                          reduction="sum"))
                             val_n += target_norm.numel()
+                            if args.pressure_tail_weight > 0:
+                                state_in = state_in_all[sl]
+                                pred_pressure = state_in[:, 0] + pred_norm[:, 0] * y_std_t[0, 0, 0, 0] + y_mean_t[0, 0, 0, 0]
+                                true_pressure = state_in[:, 0] + target_norm[:, 0] * y_std_t[0, 0, 0, 0] + y_mean_t[0, 0, 0, 0]
+                                tail = true_pressure >= args.pressure_tail_threshold_pa
+                                tail_error = (pred_pressure - true_pressure) / y_std_t[0, 0, 0, 0].clamp_min(1e-12)
+                                val_tail_sq += float((tail_error.square() * tail).sum())
+                                val_tail_n += int(tail.sum())
                             if args.plume_loss_weight > 0:
                                 state_in = state_in_all[sl]
                                 pred_out = state_in + pred_norm * y_std_t + y_mean_t
@@ -817,7 +889,9 @@ def main():
                                 val_plume_n += len(dice)
                 val_mse = val_loss / max(val_n, 1)
                 val_plume_dice_loss = val_plume_sum / max(val_plume_n, 1)
-                score = val_mse + args.plume_loss_weight * val_plume_dice_loss
+                val_pressure_tail_loss = val_tail_sq / max(val_tail_n, 1)
+                score = (val_mse + args.plume_loss_weight * val_plume_dice_loss
+                         + args.pressure_tail_weight * val_pressure_tail_loss)
                 if score < best:
                     best, best_val_mse, best_epoch, stale = score, val_mse, epoch, 0
                     torch.save({"state_dict": model.state_dict(), "backbone": backbone,
@@ -835,13 +909,22 @@ def main():
                     break
             blob = torch.load(ckpt, map_location=device, weights_only=False)
             model.load_state_dict(blob["state_dict"])
+            cpu_model = copy.deepcopy(model).to("cpu")
+            cpu_inference_ms = _inference_ms_batch1(
+                cpu_model, next(iter(test.values())), stats, rate_scale,
+                torch.device("cpu"))
             item = {"backbone": backbone, "seed": seed, "params": params,
                     "best_epoch": best_epoch, "train_seconds": round(time.time() - t0),
                     "inference_ms_sample_batch1": _inference_ms_batch1(
                         model, next(iter(test.values())), stats, rate_scale, device),
+                    "cpu_inference_ms_sample_batch1": cpu_inference_ms,
                     "inference_scope": "network forward only; excludes preprocessing and solver",
                     "best_val_mse": best_val_mse,
                     "best_val_objective": best,
+                    "one_step_validation": evaluate_one_step(
+                        model, val, stats, rate_scale, device, args),
+                    "autoregressive_validation": evaluate_rollout(
+                        model, val, stats, rate_scale, device, args),
                     "one_step_test": evaluate_one_step(model, test, stats, rate_scale, device, args),
                     "autoregressive_test": evaluate_rollout(model, test, stats, rate_scale, device, args)}
             metric_path.write_text(json.dumps(item, indent=2), encoding="utf-8")
