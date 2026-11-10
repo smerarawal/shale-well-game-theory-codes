@@ -8,6 +8,7 @@ This run uses only the corrected-physics CO₂ transition dataset. It does not a
 - **Internet:** turn on for the code-clone cell.
 - **Attach as input:** `smerarawal/transition-geology/co2_xz_dataset_v2`, mounted at `/kaggle/input/notebooks/smerarawal/transition-geology/co2_xz_dataset_v2`.
 - **Do not attach:** `spe10model2`, brine datasets, or old surrogate checkpoints. The corrected CO₂ labels already contain the SPE10 Tarbert and Upper Ness cohorts. Old checkpoints were trained on the old physics/data and are not loaded.
+- The previous preflight imported code from `/kaggle/input/datasets/smerarawal/co2-research-bundle/co2_research_run_bundle/sequential_game`. That is the older trainer snapshot: it confirms the 14-channel/five-target data contract, but it does not include `compact_unet`, `fourier_mionet`, or the pressure-tail option. Cell 3 fetches the updated trainer from this branch. If Kaggle Internet is unavailable, first publish this branch's `sequential_game/` code as a Kaggle Dataset and attach that updated dataset instead.
 - Run all cells in one Kaggle version. If Kaggle stops the run, save the notebook output, attach that output to a new version, and set `RESUME_FROM` in Cell 1 to the saved output folder. The run directories are separate by experiment so configurations cannot overwrite one another.
 
 The principal comparison is CCSNet (`ccs`), CCS-GNN (`ccs_gnn`), graph-only GNN (`gnn`), and compact U-Net (`compact_unet`), three seeds each. Fourier-MIONet is a single-seed reference first; it is an independent 2D PyTorch adaptation, not a reproduction of the published 3D model. The last cell selects two primary models using validation-only stage-6 metrics and runs separate pressure-tail and three-step-unroll ablations. The fixed test split is reported but never used to choose architectures.
@@ -49,6 +50,13 @@ import csv, hashlib
 import numpy as np
 
 cohorts = ("friendly", "intermediate", "challenging", "tarbert", "upper_ness")
+mass_residual_by_split = {s: 0.0 for s in ("train", "validation", "test")}
+with (DATA / "stage_metrics.csv").open(newline="") as f:
+    for row in csv.DictReader(f):
+        split = row.get("split")
+        value = row.get("mass_balance_residual_kg")
+        if split in mass_residual_by_split and value not in (None, ""):
+            mass_residual_by_split[split] = max(mass_residual_by_split[split], abs(float(value)))
 for split in ("train", "validation", "test"):
     pmin, pmax, trapped_nonzero, trapped_total = np.inf, -np.inf, 0, 0
     residual_max = 0.0
@@ -61,8 +69,7 @@ for split in ("train", "validation", "test"):
             for key in ("sg_trapped_in", "sg_trapped_out"):
                 trapped_nonzero += int(np.count_nonzero(np.abs(z[key]) > 1e-12))
                 trapped_total += int(z[key].size)
-            if "mass_balance_residual_kg" in z.files:
-                residual_max = max(residual_max, float(np.max(np.abs(z["mass_balance_residual_kg"]))))
+        residual_max = mass_residual_by_split[split]
     print(f"{split}: pressure=[{pmin:.6g}, {pmax:.6g}] Pa; "
           f"nonzero trapped cells={trapped_nonzero}/{trapped_total}; "
           f"max stored mass residual={residual_max:.6g} kg")
