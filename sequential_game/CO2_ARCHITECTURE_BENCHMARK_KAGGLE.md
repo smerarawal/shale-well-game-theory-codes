@@ -2,6 +2,8 @@
 
 This run uses only the corrected-physics CO₂ transition dataset. It does not attach, read, or write the brine/SPE10 water-work outputs. The input dataset is read-only; all checkpoints and reports go under `/kaggle/working/co2_architecture_run`.
 
+**Scope:** this is the full surrogate architecture benchmark: dataset audit, four primary architectures × three seeds, one Fourier-MIONet reference seed, validation-only ranking, and two separate ablations on the selected top two. The trainer reports one-step and six-stage autoregressive prediction errors, predicted component-mass residual, plume/pressure metrics, and CPU/GPU network-only timing. It does not regenerate solver labels, replay a surrogate-planned schedule through the solver, or solve the sequential game/equilibrium or institution pilot. Those are later decision-quality/game phases.
+
 ## Kaggle settings and inputs
 
 - **Accelerator:** one GPU, preferably Tesla T4. Training uses CUDA when available. Do not select T4 x2; this script trains one model at a time and does not distribute models across GPUs.
