@@ -3,8 +3,8 @@
 Example:
   python sequential_game/run_co2_multiplayer_placement.py \
     --data-dir /kaggle/input/notebooks/smerarawal/transition-geology/co2_xz_dataset_v2 \
-    --out-dir /kaggle/working/co2_multiplayer_placement --n-operators 4 \
-    --cohorts friendly challenging tarbert upper_ness
+    --out-dir /kaggle/working/co2_multiplayer_placement --n-operators 8 \
+    --cohorts challenging
 
 This runner uses exhaustive one-stage action profiles. Keep the joint profile
 count modest; it grows as (actions per operator) ** n_operators. Current CO2
@@ -158,15 +158,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--n-operators", type=int, default=4)
-    ap.add_argument("--cohorts", nargs="+", default=["friendly", "challenging", "tarbert", "upper_ness"])
+    ap.add_argument("--n-operators", type=int, default=8)
+    ap.add_argument("--cohorts", nargs="+", default=["challenging"])
     ap.add_argument("--geologies-per-cohort", type=int, default=1)
-    ap.add_argument("--dispatch-rules", nargs="+", default=["proportional", "fixed_equal"])
-    ap.add_argument("--capacity-fractions", nargs="+", type=float, default=[0.5, 1.0])
-    ap.add_argument("--pressure-damages", nargs="+", type=float, default=[0.0, 1e-9])
+    ap.add_argument("--dispatch-rules", nargs="+", default=["proportional"])
+    ap.add_argument("--capacity-fractions", nargs="+", type=float, default=[0.5])
+    ap.add_argument("--pressure-damages", nargs="+", type=float, default=[1e-9])
     ap.add_argument("--pressure-cap-mpa", type=float, default=5.0)
-    ap.add_argument("--min-spacing-ft", type=float, default=80.0)
-    ap.add_argument("--max-joint-profiles", type=int, default=5000)
+    ap.add_argument("--min-spacing-ft", type=float, default=50.0)
+    ap.add_argument("--max-joint-profiles", type=int, default=10000)
+    ap.add_argument("--cvar-alpha", type=float, default=0.25,
+                    help="lower-tail fraction for risk-sensitive payoff summaries")
+    ap.add_argument("--risk-weights", nargs="+", type=float, default=[0.0, 0.5, 1.0],
+                    help="blend mean payoff (0) with lower-tail CVaR payoff (1)")
     ap.add_argument("--starts", type=int, default=100)
     ap.add_argument("--seed", type=int, default=20261121)
     a = ap.parse_args()
@@ -179,6 +183,8 @@ def main():
     dataset_config = json.loads(config_path.read_text(encoding="utf-8"))
     params = dataset_config.get("parameters", {})
     geologies = load_geologies(data_dir, a.cohorts, a.geologies_per_cohort)
+    if not 0 < a.cvar_alpha <= 1:
+        raise ValueError("--cvar-alpha must be in (0, 1]")
     stage_days = float(params.get("stage_days", 30.0))
     full_rate = float(params.get("rate_m3_s", 1e-7))
     arms = []
@@ -221,6 +227,23 @@ def main():
         eq = analyze_n_player(expected_payoffs)
         paths = n_player_best_response_dynamics(
             expected_payoffs, starts=a.starts, update="alternating", seed=a.seed)
+        risk_summaries = []
+        tail_n = max(1, int(np.ceil(a.cvar_alpha * payoff_stack.shape[0])))
+        lower_tail_payoffs = np.sort(payoff_stack, axis=0)[:tail_n].mean(axis=0)
+        payoff_std = payoff_stack.std(axis=0, ddof=1) if payoff_stack.shape[0] > 1 \
+            else np.zeros_like(expected_payoffs)
+        for risk_weight in a.risk_weights:
+            if not 0.0 <= risk_weight <= 1.0:
+                raise ValueError("each --risk-weights value must lie in [0,1]")
+            adjusted = ((1.0 - risk_weight) * expected_payoffs
+                        + risk_weight * lower_tail_payoffs)
+            risk_eq = analyze_n_player(adjusted)
+            risk_summaries.append({
+                "risk_weight_on_lower_tail_cvar": float(risk_weight),
+                "pure_nash_profiles": risk_eq["pure_nash_profiles"],
+                "welfare_maximizers_under_adjusted_payoffs": risk_eq["welfare_maximizers"],
+                "payoffs_for_game_solution": adjusted,
+            })
         arms.append({
             "dispatch_rule": dispatch,
             "capacity_fraction_of_n_full_rate_wells": capacity_fraction,
@@ -233,6 +256,9 @@ def main():
             "expected_welfare_maximizers": eq["welfare_maximizers"],
             "best_response_convergence": summarize_dynamics(paths),
             "expected_payoffs": expected_payoffs,
+            "lower_tail_cvar_payoffs": lower_tail_payoffs,
+            "payoff_std_across_geologies": payoff_std,
+            "risk_attitude_equilibria": risk_summaries,
             "expected_resource_welfare": expected_welfare,
             "per_geology": per_geo,
         })
@@ -242,6 +268,8 @@ def main():
             "dataset_config_sha256": sha256(config_path),
             "dataset_description": dataset_config.get("description"),
             "n_operators": a.n_operators,
+            "max_site_candidates_per_operator": 2,
+            "candidate_menu": "out or one of two candidate sites at full rate",
             "solution_concept": "exact pure Nash for enumerated one-stage N-player action games; best-response paths are empirical convergence diagnostics",
             "surrogate": "not used: current merged checkpoint has two fixed operator rate channels",
             "brine_separation": "CO2 modules and metrics only",
