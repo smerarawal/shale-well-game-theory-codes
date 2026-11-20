@@ -4,15 +4,15 @@ Run from the repository root, for example:
   python sequential_game/run_co2_equilibrium_pilot.py \
     --data-dir /kaggle/input/notebooks/smerarawal/transition-geology/co2_xz_dataset_v2 \
     --out-dir /kaggle/working/co2_equilibrium_pilot \
-    --ccs-checkpoint /kaggle/input/.../co2_ccs_s0.pt \
     --pressure-tail-checkpoint /kaggle/input/.../ablation_pressure_tail/co2_ccs_gnn_s0.pt \
     --unroll3-checkpoint /kaggle/input/.../ablation_unroll3/co2_ccs_gnn_s0.pt
 
 This is an explicit finite-action pilot. Its one-stage games are exact pure-NE
-games for the enumerated actions. Best-response/fictitious/logit trajectories
-are learning-dynamics diagnostics, not an exact multi-stage Markov-perfect
-equilibrium. Placement is solver-scored because current CO2 checkpoints encode
-fixed injection cells only.
+games for the enumerated actions. The surrogate planner is the fieldwise merge
+of pressure-tail and unroll-3 CCS-GNN checkpoints. Best-response/fictitious/logit
+trajectories are learning-dynamics diagnostics, not an exact multi-stage
+Markov-perfect equilibrium. Placement is solver-scored because current CO2
+checkpoints encode fixed injection cells only.
 """
 from __future__ import annotations
 
@@ -190,10 +190,8 @@ def main():
     ap.add_argument("--capacity-fractions", nargs="+", type=float, default=[0.5, 1.0])
     ap.add_argument("--pressure-damages", nargs="+", type=float, default=[0.0, 1e-9])
     ap.add_argument("--pressure-cap-mpa", type=float, default=5.0)
-    ap.add_argument("--ccs-checkpoint")
     ap.add_argument("--pressure-tail-checkpoint")
     ap.add_argument("--unroll3-checkpoint")
-    ap.add_argument("--ccs-checkpoints", nargs="+")
     ap.add_argument("--pressure-tail-checkpoints", nargs="+")
     ap.add_argument("--unroll3-checkpoints", nargs="+")
     ap.add_argument("--device", default="cpu")
@@ -214,31 +212,31 @@ def main():
     print(f"Selected {len(geologies)} held-out stage-0 geologies", flush=True)
 
     models = {}
-    ccs_paths = list(a.ccs_checkpoints or []) + ([a.ccs_checkpoint] if a.ccs_checkpoint else [])
     tail_paths = list(a.pressure_tail_checkpoints or []) + (
         [a.pressure_tail_checkpoint] if a.pressure_tail_checkpoint else [])
     unroll_paths = list(a.unroll3_checkpoints or []) + (
         [a.unroll3_checkpoint] if a.unroll3_checkpoint else [])
-    def add_models(paths, label):
-        family = {}
-        for path in paths:
-            model = load_co2_checkpoint(path, device=a.device)
-            seed = model["blob"].get("seed", "unknown")
-            name = f"{label}_seed{seed}"
-            if name in models:
-                raise ValueError(f"duplicate {label} checkpoint seed {seed}")
-            models[name] = model
-            family[seed] = path
-        return family
-    add_models(ccs_paths, "ccs")
-    tail_by_seed = add_models(tail_paths, "ccs_gnn_pressure_tail")
-    unroll_by_seed = add_models(unroll_paths, "ccs_gnn_unroll3")
-    if tail_by_seed and unroll_by_seed:
-        shared_seeds = sorted(set(tail_by_seed).intersection(unroll_by_seed), key=str)
-        if not shared_seeds:
-            raise ValueError("pressure-tail and unroll-3 checkpoint lists need matched seed IDs")
-        for seed in shared_seeds:
-            name = f"fieldwise_pressure_tail_plus_unroll3_seed{seed}"
+    if bool(tail_paths) != bool(unroll_paths):
+        raise ValueError("merge-only mode requires both pressure-tail and unroll-3 checkpoint(s)")
+    if tail_paths:
+        tail_by_seed = {}
+        unroll_by_seed = {}
+        for path in tail_paths:
+            item = load_co2_checkpoint(path, device=a.device)
+            seed = item["blob"].get("seed")
+            if seed in tail_by_seed:
+                raise ValueError(f"duplicate pressure-tail seed {seed}")
+            tail_by_seed[seed] = path
+        for path in unroll_paths:
+            item = load_co2_checkpoint(path, device=a.device)
+            seed = item["blob"].get("seed")
+            if seed in unroll_by_seed:
+                raise ValueError(f"duplicate unroll-3 seed {seed}")
+            unroll_by_seed[seed] = path
+        if set(tail_by_seed) != set(unroll_by_seed):
+            raise ValueError("merge-only mode requires matched seed IDs in both checkpoint lists")
+        for seed in sorted(tail_by_seed, key=str):
+            name = f"merged_ccs_gnn_seed{seed}"
             models[name] = make_pressure_tail_unroll3_hybrid(
                 tail_by_seed[seed], unroll_by_seed[seed], device=a.device)
 
@@ -406,7 +404,7 @@ def main():
         "code_module": "sequential_game.co2_equilibrium_lab",
         "solver": "CO2XZSolver; dataset dx/dy/dz; stage duration from dataset_config",
         "equilibrium_claim": "one-stage pure Nash in the enumerated action game; learning dynamics diagnostics",
-        "surrogate_claim": "one-stage planner payoff forecasts on the fixed trained well cells only; all selected profiles solver replayed",
+        "surrogate_claim": "merge-only: pressure-tail pressure delta plus unroll-3 other state deltas, one-stage forecasts on fixed trained well cells; selected profiles solver replayed",
         "placement_claim": "one-stage placement equilibria scored by solver over supplied held-out geology sample; not full MPE",
         "model_checkpoints": {k: {
             "path": v["checkpoint"],

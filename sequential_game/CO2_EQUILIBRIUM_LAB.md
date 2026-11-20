@@ -6,7 +6,7 @@ This is a CO₂-only addition. It imports the CO₂ stage solver and well-placem
 
 `run_co2_equilibrium_pilot.py` creates paired finite games for held-out stage-0 geologies.
 
-1. **Fixed-location rate game:** compare solver-payoff equilibrium with planner equilibria from CCS, pressure-tail CCS-GNN, three-step-unroll CCS-GNN, and a fieldwise pressure-tail/unroll-3 composition. Every planner-selected profile is evaluated against the same solver payoff table. Pressure-tail supplies only the pressure-change head in the proposed composition; unroll-3 supplies the other four field changes. The composition is experimental and is not a trained or established winner.
+1. **Fixed-location rate game:** use one fieldwise merged surrogate. Pressure-tail CCS-GNN supplies the pressure change; three-step-unroll CCS-GNN supplies mobile gas, trapped gas, historical maximum gas, and dissolved-CO₂ changes. The merged planner's selected profiles are checked by solver replay and unilateral deviation regret. This run does not compare the component architectures.
 2. **Placement game:** each operator chooses no well, or one of two candidate sites and a half/full rate. This is evaluated with the CO₂ solver across the held-out geology sample. The current surrogate training features hard-code two injection cells, so variable-site forecasts are out of distribution and deliberately prohibited.
 3. **Equilibrium dynamics:** report all pure Nash profiles and all welfare-maximizing profiles for the expected-payoff game. Then compare random-start alternating and simultaneous best response, fictitious play, and damped logit response over several initializations/temperatures. Report exact unilateral regret at the selected terminal profiles, cycles, and non-convergence.
 4. **Sensitivity arms:** vary pipeline dispatch, capacity, and the exploratory pressure-damage weight. These payoff coefficients are scenario assumptions, not calibrated monetary estimates.
@@ -52,22 +52,20 @@ assert all((DATA_DIR / split / 'friendly.npz').is_file()
 print((DATA_DIR / 'dataset_config.json').read_text()[:2500])
 ```
 
-Then run the pilot. Set the optional checkpoint variables to their mounted paths; the script still runs solver-only when they are empty. For a fair architecture comparison, supply all three matched seeds for each family. The fieldwise composition is automatically paired by seed.
+Then run the pilot. Supply both matched checkpoint families to enable the merged surrogate. The script can also run the solver-only placement experiment if both lists are empty. Use matched seed IDs; it builds one merged model for each seed.
 
 ```python
 from pathlib import Path
 import subprocess, sys
 
 OUT = Path('/kaggle/working/co2_equilibrium_pilot')
-CCS = []            # e.g. ['/kaggle/input/.../co2_ccs_s0.pt', ... seeds 1 and 2]
 PRESSURE_TAIL = []  # e.g. ['/kaggle/input/.../ablation_pressure_tail/co2_ccs_gnn_s0.pt', ...]
 UNROLL3 = []        # e.g. ['/kaggle/input/.../ablation_unroll3/co2_ccs_gnn_s0.pt', ...]
 cmd = [sys.executable, str(REPO / 'sequential_game' / 'run_co2_equilibrium_pilot.py'),
        '--data-dir', str(DATA_DIR), '--out-dir', str(OUT),
        '--cohorts', 'friendly', 'challenging', 'tarbert', 'upper_ness',
        '--geologies-per-cohort', '1', '--device', 'cpu']
-for flag, values in [('--ccs-checkpoints', CCS),
-                     ('--pressure-tail-checkpoints', PRESSURE_TAIL),
+for flag, values in [('--pressure-tail-checkpoints', PRESSURE_TAIL),
                      ('--unroll3-checkpoints', UNROLL3)]:
     if values:
         cmd += [flag, *values]
