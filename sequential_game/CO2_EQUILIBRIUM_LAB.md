@@ -13,6 +13,33 @@ This is a CO₂-only addition. It imports the CO₂ stage solver and well-placem
 
 The pilot solves a one-stage game exactly for the enumerated actions. Repeating a stage-local equilibrium at future states would be a myopic state-conditioned feedback policy; it is not a finite-horizon Markov-perfect equilibrium. A proper MPE result still requires continuation values or policy-level deviation checks across full trajectories.
 
+## More than two operators
+
+The physical CO₂ game and placement adapter support a configurable number of operators. The original equilibrium pilot was restricted to two players because its payoff analysis used a bimatrix. `co2_equilibrium_lab.py` now also has an n-player payoff-tensor solver and multi-start best-response dynamics, and `run_co2_multiplayer_placement.py` runs an exact one-stage placement game for configurable operator counts.
+
+The multi-operator experiment offers each operator three actions: do not drill, or drill at either of two candidate cells and inject at the configured full rate. For four operators this is 81 joint profiles per geology and scenario arm; each profile is evaluated by the CO₂ solver. It reports exact pure Nash profiles, welfare maxima, and the frequency with which random-start best response reaches a pure Nash profile.
+
+This runner is solver-only. Existing merged checkpoints have exactly two fixed operator-rate channels and do not support many operators or variable sites. For a valid multi-operator surrogate, regenerate CO₂ trajectories with randomized legal well locations and multiple operators, train on a total well-rate map (and owner/tracer channels if needed for attribution), preserve geology-level splits, then validate action regret against solver replays.
+
+Example Kaggle command for four operators, one geology per cohort, and a single pilot arm:
+
+```python
+cmd = [sys.executable,
+       str(REPO / 'sequential_game' / 'run_co2_multiplayer_placement.py'),
+       '--data-dir', str(DATA_DIR),
+       '--out-dir', '/kaggle/working/co2_multiplayer_placement',
+       '--n-operators', '4',
+       '--cohorts', 'friendly', 'challenging', 'tarbert', 'upper_ness',
+       '--geologies-per-cohort', '1',
+       '--dispatch-rules', 'proportional',
+       '--capacity-fractions', '0.5',
+       '--pressure-damages', '1e-9',
+       '--min-spacing-ft', '80']
+subprocess.run(cmd, check=True)
+```
+
+The current 24×24 domain and 80 ft spacing support only a modest number of distinct candidate cells. The action-profile count grows exponentially as `3 ** n_operators`; keep the exact game small, and move to sampled deviations or double-oracle methods for larger operator populations. The 80 ft spacing and pressure/payoff values are pilot assumptions that need scenario justification.
+
 ## Kaggle inputs and runtime
 
 Attach:
