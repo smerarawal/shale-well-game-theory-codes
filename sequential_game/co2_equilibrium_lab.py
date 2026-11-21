@@ -255,6 +255,18 @@ def make_pressure_tail_unroll3_hybrid(
     dynamics = load_co2_checkpoint(dynamics_checkpoint, device=device)
     if pressure["blob"]["backbone"] != "ccs_gnn" or dynamics["blob"]["backbone"] != "ccs_gnn":
         raise ValueError("this composition expects two CCS-GNN checkpoints")
+    pressure_mode = pressure["blob"].get("well_input_mode", "legacy_two_fixed_wells_v1")
+    dynamics_mode = dynamics["blob"].get("well_input_mode", "legacy_two_fixed_wells_v1")
+    if pressure_mode != dynamics_mode:
+        raise ValueError("paired checkpoints disagree on well input mode")
+    if pressure["blob"].get("seed") != dynamics["blob"].get("seed"):
+        raise ValueError("paired checkpoints must use the same training seed")
+    pressure_args = pressure["blob"].get("args", {})
+    dynamics_args = dynamics["blob"].get("args", {})
+    if float(pressure_args.get("pressure_tail_weight", 0.0)) <= 0:
+        raise ValueError("pressure checkpoint must be trained with pressure-tail weighting")
+    if int(dynamics_args.get("rollout_unroll", 1)) != 3:
+        raise ValueError("dynamics checkpoint must be trained with rollout-unroll=3")
     for key in ("rate_scale",):
         if not np.isclose(pressure[key], dynamics[key], rtol=0, atol=1e-12):
             raise ValueError(f"paired checkpoints disagree on {key}")
@@ -274,7 +286,8 @@ def make_pressure_tail_unroll3_hybrid(
         return hybrid
     return {"model": None, "stats": dynamics["stats"],
             "rate_scale": dynamics["rate_scale"], "device": dynamics["device"],
-            "blob": {"backbone": "ccs_gnn_pressure_tail+unroll3", "seed": None},
+            "blob": {"backbone": "ccs_gnn_pressure_tail+unroll3", "seed": None,
+                     "well_input_mode": pressure_mode},
             "trainer": dynamics["trainer"], "checkpoint":
                 f"{pressure['checkpoint']}|{dynamics['checkpoint']}",
             "predict_delta_fn": predict_delta,
@@ -402,6 +415,146 @@ def evaluate_surrogate_stage_game(
             "checkpoint_backbone": surrogate["blob"]["backbone"],
             "checkpoint_seed": surrogate["blob"].get("seed"),
             "surrogate_scope": "fixed trained injection cells; one-stage transition"}
+
+
+def evaluate_surrogate_n_player_stage_game(
+    game: Any,
+    state: Any,
+    geology: dict[str, np.ndarray],
+    actions_by_operator: Sequence[Sequence[Any]],
+    surrogate: dict[str, Any],
+    *,
+    dx_ft: float,
+    dy_ft: float,
+    dz_ft: float,
+    gravity_sign: int = 1,
+) -> dict[str, Any]:
+    """Evaluate an n-player placement game with an aggregate-map CO2 checkpoint.
+
+    This is a one-stage planner/equilibrium screen. It requires a checkpoint
+    trained with ``well_input_mode=aggregate_well_map_v1`` and preserves each
+    operator's requested/delivered mass and payoff ledger.
+    """
+    from itertools import product
+    try:
+        from .co2_pipeline_game import dispatch_mass
+    except ImportError:
+        from co2_pipeline_game import dispatch_mass
+    n_ops = game.config.n_operators
+    if len(actions_by_operator) != n_ops:
+        raise ValueError("provide one action set per configured operator")
+    if surrogate["blob"].get("well_input_mode") != "aggregate_well_map_v1":
+        raise ValueError("checkpoint is not trained for aggregate multiwell source maps")
+    if state.stage + 1 != game.config.horizon:
+        raise ValueError("surrogate game scoring currently requires a terminal one-stage game")
+    shape = np.asarray(geology["phi"]).shape
+    if len(shape) != 2 or np.asarray(geology["kx_mD"]).shape != shape \
+            or np.asarray(geology["kz_mD"]).shape != shape:
+        raise ValueError("geology arrays must share [z,x] shape")
+    action_shape = tuple(len(x) for x in actions_by_operator)
+    if any(v < 1 for v in action_shape):
+        raise ValueError("each operator needs at least one action")
+    cfg = game.config
+    rho = float(game.solver.cfg.rho_co2_kg_m3)
+    dyn0 = state.core.reservoir
+    trainer = surrogate["trainer"]
+    payoffs = np.zeros(action_shape + (n_ops,), dtype=np.float64)
+    welfare = np.zeros(action_shape, dtype=np.float64)
+    pressure = np.zeros(action_shape, dtype=np.float64)
+    injected = np.zeros(action_shape + (n_ops,), dtype=np.float64)
+    predicted = {}
+    for profile in product(*(range(v) for v in action_shape)):
+        acts = tuple(actions_by_operator[p][profile[p]] for p in range(n_ops))
+        requests = np.zeros(n_ops, dtype=np.float64)
+        placements, per_operator_wells = [], []
+        used_cells = set()
+        for op, action in enumerate(acts):
+            rate_by_id = {str(r.well_id): float(r.rate_m3_s) for r in action.rates}
+            own = []
+            for well in action.placements:
+                if well.well_type != "injector":
+                    raise ValueError("surrogate pilot currently supports injector placements only")
+                cell = (int(well.z_index), int(well.x_index))
+                if cell in used_cells:
+                    raise ValueError(f"two operators selected the same well cell {cell}")
+                used_cells.add(cell)
+                q = rate_by_id.get(str(well.well_id), 0.0)
+                if q < 0 or not np.isfinite(q):
+                    raise ValueError("well rates must be finite and nonnegative")
+                own.append((cell[0], cell[1], q))
+                requests[op] += q
+            if set(rate_by_id) - {str(w.well_id) for w in action.placements}:
+                raise ValueError("rate action references a well without a placement")
+            per_operator_wells.append(own)
+        requested_mass = requests * cfg.stage_duration_s * rho
+        delivered = dispatch_mass(requested_mass,
+                                  cfg.pipeline.available_mass_kg_per_stage,
+                                  cfg.pipeline.dispatch_rule)
+        if cfg.storage_cap_kg is not None:
+            remaining = max(0.0, cfg.storage_cap_kg
+                            - float(state.core.cumulative_injected_kg_by_operator.sum()))
+            if cfg.storage_dispatch_rule == "fixed_equal":
+                quota = np.maximum(cfg.storage_cap_kg / n_ops
+                                   - state.core.cumulative_injected_kg_by_operator, 0.0)
+                delivered = np.minimum(delivered, quota)
+            else:
+                delivered = dispatch_mass(delivered, remaining, cfg.storage_dispatch_rule)
+        scale = np.divide(delivered, requested_mass, out=np.zeros_like(delivered),
+                          where=requested_mass > 0)
+        rate_map = np.zeros(shape, dtype=np.float32)
+        count_map = np.zeros(shape, dtype=np.float32)
+        for op, wells in enumerate(per_operator_wells):
+            for z, x, requested in wells:
+                actual = requested * scale[op]
+                if actual > 0:
+                    rate_map[z, x] += actual
+                    count_map[z, x] += 1.0
+        data = {
+            "kx_mD": np.asarray(geology["kx_mD"], dtype=np.float32)[None],
+            "kz_mD": np.asarray(geology["kz_mD"], dtype=np.float32)[None],
+            "phi": np.asarray(geology["phi"], dtype=np.float32)[None],
+            "well_rate_map": rate_map[None], "well_count_map": count_map[None],
+            "rate_total_m3_s": np.asarray([rate_map.sum()], dtype=np.float32),
+            "rate_operator_0_m3_s": np.asarray([requests[0]], dtype=np.float32),
+            "rate_operator_1_m3_s": np.asarray([requests[1] if n_ops > 1 else 0.0], dtype=np.float32),
+            "dx_ft": np.asarray([dx_ft], dtype=np.float32),
+            "dy_ft": np.asarray([dy_ft], dtype=np.float32),
+            "dz_ft": np.asarray([dz_ft], dtype=np.float32),
+        }
+        dynamic = {k: np.asarray(dyn0[k], dtype=np.float32)[None]
+                   for k in trainer.STATE_KEYS}
+        predict_fn = surrogate.get("predict_delta_fn")
+        if predict_fn is not None:
+            delta = predict_fn(data, dynamic)
+        else:
+            delta = trainer.predict_delta(surrogate["model"], data, surrogate["stats"],
+                                          surrogate["rate_scale"], surrogate["device"],
+                                          batch=1, dynamic=dynamic)
+        pred = trainer._to_states(data, delta, dynamic=dynamic)
+        predicted[profile] = pred
+        pmax = float(np.max(pred["p_pa"]))
+        pressure[profile] = pmax
+        injected[profile] = delivered
+        pipeline_cost = delivered * cfg.pipeline.resource_cost_per_kg
+        tariff = delivered * cfg.pipeline.tariff_per_kg
+        drill_cost = np.asarray([len(a.placements) for a in acts]) * cfg.payoff.drilling_cost_per_well
+        exceed = max(0.0, pmax - float(cfg.payoff.pressure_cap_pa or 0.0))
+        pressure_cost = cfg.payoff.pressure_damage_per_pa2 * exceed ** 2
+        liability = delivered / delivered.sum() if delivered.sum() > 0 else np.zeros(n_ops)
+        damage = pressure_cost * liability
+        storage = (state.core.cumulative_injected_kg_by_operator + delivered) \
+            * cfg.payoff.storage_value_per_kg
+        factor = cfg.discount_factor ** state.stage
+        payoffs[profile] = (storage - pipeline_cost - tariff - drill_cost - damage) * factor
+        welfare[profile] = float((storage.sum() - pipeline_cost.sum() - tariff.sum()
+                                  - drill_cost.sum() - pressure_cost) * factor)
+    return {"payoffs": payoffs, "resource_welfare": welfare,
+            "pressure_max_pa": pressure, "injected_kg_by_operator": injected,
+            "analysis": analyze_n_player(payoffs), "predicted_states": predicted,
+            "action_counts": list(action_shape), "checkpoint": surrogate["checkpoint"],
+            "checkpoint_backbone": surrogate["blob"].get("backbone"),
+            "checkpoint_seed": surrogate["blob"].get("seed"),
+            "surrogate_scope": "aggregate well-rate/count maps; terminal one-stage n-player game"}
 
 
 def compare_planner_to_solver(

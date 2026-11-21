@@ -306,12 +306,20 @@ def build_x(data, rate_scale, dynamic=None):
     dyn = dynamic or {key: data[f"{key}_in"] for key in STATE_KEYS}
     xcoord = np.broadcast_to(np.linspace(-1, 1, w, dtype=np.float32)[None, None, :], (n, h, w))
     zcoord = np.broadcast_to(np.linspace(-1, 1, h, dtype=np.float32)[None, :, None], (n, h, w))
-    r0 = np.zeros((n, h, w), dtype=np.float32)
-    r1 = np.zeros_like(r0)
-    wz = h - 2
-    wx0, wx1 = max(1, w // 3), min(w - 2, (2 * w) // 3)
-    r0[:, wz, wx0] = data["rate_operator_0_m3_s"] / rate_scale
-    r1[:, wz, wx1] = data["rate_operator_1_m3_s"] / rate_scale
+    if "well_rate_map" in data:
+        # New location-aware CO2 datasets encode the aggregate physical source
+        # map and active-well count. The two legacy source channels are reused,
+        # so old checkpoints and the 14-channel model definitions stay intact.
+        r0 = np.asarray(data["well_rate_map"], dtype=np.float32) / rate_scale
+        r1 = np.asarray(data["well_count_map"], dtype=np.float32) / 8.0
+    else:
+        # Historical fixed two-well dataset input contract.
+        r0 = np.zeros((n, h, w), dtype=np.float32)
+        r1 = np.zeros_like(r0)
+        wz = h - 2
+        wx0, wx1 = max(1, w // 3), min(w - 2, (2 * w) // 3)
+        r0[:, wz, wx0] = data["rate_operator_0_m3_s"] / rate_scale
+        r1[:, wz, wx1] = data["rate_operator_1_m3_s"] / rate_scale
     dx = np.log(np.maximum(data["dx_ft"], 1e-6)).astype(np.float32)[:, None, None]
     dz = np.log(np.maximum(data["dz_ft"], 1e-6)).astype(np.float32)[:, None, None]
     dx = np.broadcast_to(dx, (n, h, w)); dz = np.broadcast_to(dz, (n, h, w))
@@ -519,7 +527,13 @@ def score_states(pred, truth, data, args):
         thresh = np.quantile(ptrue[i], 0.9)
         mask = ptrue[i] >= thresh
         top_errors.extend((ppred[i][mask] - ptrue[i][mask]).ravel().tolist())
-        well_errors.extend((ppred[i, well_z, list(well_x)] - ptrue[i, well_z, list(well_x)]).tolist())
+        if "well_locations_zx" in data:
+            for z, x in data["well_locations_zx"][i, :int(data["n_operators"][i])]:
+                if z >= 0 and x >= 0:
+                    well_errors.append(float(ppred[i, z, x] - ptrue[i, z, x]))
+        else:
+            well_errors.extend((ppred[i, well_z, list(well_x)]
+                                - ptrue[i, well_z, list(well_x)]).tolist())
         a, b = (pred["sg_mobile"][i] >= 0.01,
                 truth["sg_mobile"][i] >= 0.01)
         union = np.logical_or(a, b).sum()
@@ -553,7 +567,9 @@ def score_states(pred, truth, data, args):
         gas = RHO_CO2 * pv * (s["sg_mobile"] + s["sg_trapped"])
         water = pv * (1.0 - s["sg_mobile"] - s["sg_trapped"]) * s["c_dissolved_kg_m3"]
         return (gas + water).sum(axis=(1, 2))
-    injected = RHO_CO2 * (data["rate_operator_0_m3_s"] + data["rate_operator_1_m3_s"]) * args.stage_days * 86400.0
+    total_rate = data.get("rate_total_m3_s", data["rate_operator_0_m3_s"]
+                          + data["rate_operator_1_m3_s"])
+    injected = RHO_CO2 * total_rate * args.stage_days * 86400.0
     residual = mass(pred) - mass({key: data[f"{key}_in"] for key in STATE_KEYS}) - injected
     out["predicted_mass_balance_abs_mean_kg"] = float(np.mean(np.abs(residual)))
     out["predicted_mass_balance_abs_p95_kg"] = float(np.percentile(np.abs(residual), 95))
@@ -713,14 +729,9 @@ def main():
     train = {c: load_cohort(data_dir, "train", c) for c in COHORTS}
     val = {c: load_cohort(data_dir, "validation", c) for c in COHORTS}
     test = {c: load_cohort(data_dir, "test", c) for c in COHORTS}
-    rate_scale = max(
-        max(
-            float(max(np.max(d["rate_operator_0_m3_s"]),
-                      np.max(d["rate_operator_1_m3_s"])))
-            for d in train.values()
-        ),
-        1e-12,
-    )
+    rate_scale = max(max(float(np.max(d.get(
+        "rate_total_m3_s", d["rate_operator_0_m3_s"] + d["rate_operator_1_m3_s"])))
+                         for d in train.values()), 1e-12)
     x_parts = [build_x(d, rate_scale) for d in train.values()]
     y_parts = [build_y(d) for d in train.values()]
     x_train, y_train = np.concatenate(x_parts), np.concatenate(y_parts)
@@ -729,15 +740,19 @@ def main():
         cell_volume = ((d["dx_ft"] * 0.3048) * (d["dy_ft"] * 0.3048)
                        * (d["dz_ft"] * 0.3048))
         pv_parts.append(d["phi"] * cell_volume[:, None, None])
-        inject_parts.append(RHO_CO2 * (d["rate_operator_0_m3_s"]
-                                      + d["rate_operator_1_m3_s"])
-                            * args.stage_days * 86400.0)
+        total_rate = d.get("rate_total_m3_s", d["rate_operator_0_m3_s"]
+                           + d["rate_operator_1_m3_s"])
+        inject_parts.append(RHO_CO2 * total_rate * args.stage_days * 86400.0)
         state_parts.append(np.stack([d[f"{key}_in"] for key in STATE_KEYS], axis=1))
     pv_train = np.concatenate(pv_parts).astype(np.float32)
     inject_train = np.concatenate(inject_parts).astype(np.float32)
     state_train = np.concatenate(state_parts).astype(np.float32)
     sequence_keys = ("kx_mD", "kz_mD", "phi", "rate_operator_0_m3_s",
-                     "rate_operator_1_m3_s", "dx_ft", "dy_ft", "dz_ft")
+                     "rate_operator_1_m3_s", "rate_total_m3_s", "well_rate_map",
+                     "well_count_map", "dx_ft", "dy_ft", "dz_ft")
+    if "well_rate_map" not in next(iter(train.values())):
+        sequence_keys = ("kx_mD", "kz_mD", "phi", "rate_operator_0_m3_s",
+                         "rate_operator_1_m3_s", "dx_ft", "dy_ft", "dz_ft")
     sequence_data = {key: np.concatenate([d[key] for d in train.values()])
                      for key in sequence_keys}
     sequence_windows = (_sequence_windows(train, args.rollout_unroll)
@@ -897,6 +912,9 @@ def main():
                     torch.save({"state_dict": model.state_dict(), "backbone": backbone,
                                 "width": args.width, "seed": seed, "params": params,
                                 "rate_scale": rate_scale,
+                                "well_input_mode": ("aggregate_well_map_v1"
+                                                    if "well_rate_map" in next(iter(train.values()))
+                                                    else "legacy_two_fixed_wells_v1"),
                                 "stats": {k: v.tolist() for k, v in stats.items()},
                                 "args": vars(args)}, ckpt)
                 else:

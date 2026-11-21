@@ -125,4 +125,99 @@ The output `co2_equilibrium_pilot.json` includes hashes, geology IDs, game arms,
 
 The current multi-operator code implements the first decision experiment: candidate-site portfolios across a small set of geology realizations, an expected-payoff Nash game, a mean/lower-tail risk sensitivity, and best-response convergence diagnostics. It does not yet implement distance-space posterior inference, history matching, monitoring-driven belief updates, or sequential re-optimization.
 
-Before enabling merged-surrogate forecasts for many operators or new sites, regenerate CO₂ trajectories with randomized well positions and a larger operator count, then split by geology. The current checkpoints only encode two fixed operator rate channels.
+## Eight-operator location-aware surrogate workflow
+
+This path adds the spatial aggregate-rate and active-well-count maps to the two existing source channels. The surrogate represents the reservoir's combined physical input; the game continues to track each operator's requested rate, delivered mass, and payoff separately. `generate_co2_multiwell_dataset.py` retains the source dataset's geology-level train/validation/test assignment and writes a new dataset directory. It never overwrites the source. Use a **corrected-physics geology dataset** as its input if this is for final research; the 7,488-transition historical dataset with the old permeability upscaling remains a historical baseline. The generated config records the exact source config hash.
+
+### Kaggle inputs and hardware
+
+- Data-generation notebook: attach the corrected-physics CO₂ transition dataset and this code repository. Use **CPU** for the reference solver. It may take hours; start with one cohort to estimate the runtime, then generate all cohorts.
+- Training notebook: attach the saved multiwell dataset and code repository. Use a **GPU** (T4 is fine); the solver is not involved in training.
+- Game notebook: attach the multiwell dataset, code repository, and both matched CCS-GNN checkpoint output datasets. Use **GPU** for the surrogate's 6,561 profile evaluations; solver replays remain CPU work. Start with one challenging held-out geology.
+- Keep these CO₂ outputs separate from all brine data and checkpoints.
+
+Clone the authorized branch in each Kaggle notebook:
+
+```python
+from pathlib import Path
+import subprocess, sys
+
+REPO = Path('/kaggle/working/shale-well-game-theory-codes')
+if not REPO.exists():
+    subprocess.run(['git', 'clone', '--depth', '1', '--branch',
+        'codex/co2-architecture-benchmark',
+        'https://github.com/smerarawal/shale-well-game-theory-codes.git', str(REPO)], check=True)
+sys.path.insert(0, str(REPO / 'sequential_game'))
+```
+
+### 1. Regenerate multiwell trajectories (CPU)
+
+Set `SOURCE_DATA` to the corrected-physics CO₂ dataset mount, not the old historical dataset if a corrected output is available. This preserves its split assignments and map arrays while simulating new randomized 2–8 operator well configurations. The default makes 12 six-stage episodes per geology and produces 2,4,6,8-operator coverage plus randomized counts:
+
+```python
+from pathlib import Path
+import subprocess, sys
+
+SOURCE_DATA = Path('/kaggle/input/.../corrected_co2_dataset')
+MULTIWELL = Path('/kaggle/working/co2_multiwell_v1')
+assert (SOURCE_DATA / 'dataset_config.json').is_file()
+cmd = [sys.executable, str(REPO / 'sequential_game' / 'generate_co2_multiwell_dataset.py'),
+       '--input-dir', str(SOURCE_DATA), '--out-dir', str(MULTIWELL),
+       '--episodes-per-geology', '12', '--stages', '6', '--stage-days', '30',
+       '--rate-m3-s-per-operator', '1e-7', '--min-spacing-cells', '1']
+print(' '.join(cmd))
+subprocess.run(cmd, check=True)
+print((MULTIWELL / 'dataset_config.json').read_text())
+```
+
+Publish `/kaggle/working/co2_multiwell_v1` as a private Kaggle output dataset after generation; attach it to the next notebook. For a short runtime pilot, add `--cohorts challenging`; then rerun for all cohorts before training the research model. Do not treat data generated from the historical input maps as corrected geology.
+
+### 2. Train the paired CCS-GNN models (GPU)
+
+Run the command twice in the same GPU notebook. Both runs must use the same multiwell data and seed IDs. First pressure-tail:
+
+```python
+DATA = Path('/kaggle/input/.../co2-multiwell-v1')
+PRESSURE_OUT = Path('/kaggle/working/co2_multiwell_pressure_tail')
+cmd = [sys.executable, str(REPO / 'sequential_game' / 'train_co2_xz_surrogate.py'),
+       '--data-dir', str(DATA), '--out-dir', str(PRESSURE_OUT),
+       '--backbones', 'ccs_gnn', '--seeds', '0', '1', '2',
+       '--epochs', '60', '--patience', '10', '--batch-size', '64', '--width', '32',
+       '--device', 'cuda', '--rollout-unroll', '1',
+       '--pressure-tail-weight', '0.5', '--pressure-tail-quantile', '0.90']
+subprocess.run(cmd, check=True)
+```
+
+Then unroll-3 CCS-GNN:
+
+```python
+DYNAMICS_OUT = Path('/kaggle/working/co2_multiwell_unroll3')
+cmd = [sys.executable, str(REPO / 'sequential_game' / 'train_co2_xz_surrogate.py'),
+       '--data-dir', str(DATA), '--out-dir', str(DYNAMICS_OUT),
+       '--backbones', 'ccs_gnn', '--seeds', '0', '1', '2',
+       '--epochs', '60', '--patience', '10', '--batch-size', '64', '--width', '32',
+       '--device', 'cuda', '--rollout-unroll', '3']
+subprocess.run(cmd, check=True)
+```
+
+Before the long run, verify at least one checkpoint contains `well_input_mode=aggregate_well_map_v1`. Keep the pressure-tail and unroll-3 outputs as separate Kaggle output datasets. The merged fieldwise planner requires matching seed IDs and identical normalization metadata.
+
+### 3. Run the 8-operator game and solver checks
+
+Attach the multiwell dataset and both checkpoint datasets. Choose matching seed checkpoints. GPU accelerates surrogate scoring; the exact solver replays use CPU. The action menu is out or one full-rate well at either of two candidate locations per operator, so the surrogate scores 3⁸ = 6,561 profiles. Solver replay is restricted to surrogate Nash/welfare candidates and every unilateral deviation from each candidate:
+
+```python
+DATA = Path('/kaggle/input/.../co2-multiwell-v1')
+PRESSURE = '/kaggle/input/.../co2-multiwell-pressure-tail/co2_ccs_gnn_s0.pt'
+DYNAMICS = '/kaggle/input/.../co2-multiwell-unroll3/co2_ccs_gnn_s0.pt'
+OUT = Path('/kaggle/working/co2_multiwell_8op_game')
+cmd = [sys.executable, str(REPO / 'sequential_game' / 'run_co2_multiwell_surrogate_game.py'),
+       '--data-dir', str(DATA), '--pressure-checkpoint', PRESSURE,
+       '--dynamics-checkpoint', DYNAMICS, '--out-dir', str(OUT),
+       '--n-operators', '8', '--cohorts', 'challenging',
+       '--geologies-per-cohort', '1', '--device', 'cuda',
+       '--max-solver-replays', '20']
+subprocess.run(cmd, check=True)
+```
+
+Use the matching seed checkpoint paths in both arguments (for seed 1 or 2, replace both paths). Read `co2_multiwell_surrogate_game.json`: it reports surrogate pure-Nash candidates, surrogate welfare maximizers, solver replay pressure/welfare/payoffs, and maximum unilateral solver regret. A low regret on one geology is a case-specific result. This remains a one-stage terminal game; it does not establish a multi-stage Markov-perfect equilibrium. Save `/kaggle/working/co2_multiwell_8op_game` as Kaggle output.
